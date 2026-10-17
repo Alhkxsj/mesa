@@ -58,6 +58,7 @@ _Static_assert(BASE_MEM_MAP_TRACKING_HANDLE == (3ull << 12), "tracking offset");
 
 #define FAKE_FD 123
 #define REOPEN_FD 124
+#define IMPORT_FD 125
 #define PAGE_SIZE 4096
 
 struct fake_mapping {
@@ -88,6 +89,13 @@ static uint64_t alias_cookie = 0xa0000000ull;
 static uint64_t alias_gpu_va = 0xa0000000ull;
 static bool fail_jit_init;
 static bool fail_heap_term;
+static unsigned mem_import_calls;
+static uint64_t import_cookie = 0xb0000000ull;
+static uint64_t import_output_pages;
+static uint64_t import_output_flags = BASE_MEM_NEED_MMAP | BASE_MEM_PROT_GPU_RD |
+                                      BASE_MEM_PROT_GPU_WR;
+static bool fail_mem_import;
+static bool import_zero_pages;
 static bool fail_alias_mmap;
 static bool fail_alias_unmap;
 static uint64_t alias_output_flags;
@@ -199,6 +207,13 @@ reset_fake(void)
    csf = true;
    version_major = 1;
    version_minor = 9;
+   mem_import_calls = 0;
+   import_cookie = 0xb0000000ull;
+   import_output_pages = 0;
+   import_output_flags = BASE_MEM_NEED_MMAP | BASE_MEM_PROT_GPU_RD |
+                         BASE_MEM_PROT_GPU_WR;
+   fail_mem_import = false;
+   import_zero_pages = false;
    next_cookie = BASE_MEM_COOKIE_BASE;
    allocator_calls = allocator_fail_at = 0;
    open_calls = 0; fail_open = false; memset(close_fds, 0, sizeof(close_fds));
@@ -353,6 +368,24 @@ __wrap_ioctl(int fd, unsigned long request, ...)
    if (request == KBASE_IOCTL_MEM_FREE) {
       check(((struct kbase_ioctl_mem_free *)arg)->gpu_addr != 0);
       mem_free_calls++;
+      return 0;
+   }
+   if (request == KBASE_IOCTL_MEM_IMPORT) {
+      union kbase_ioctl_mem_import *req = arg;
+      check(req->in.type == BASE_MEM_IMPORT_TYPE_UMM);
+      check(req->in.flags & (BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR));
+      check(!(req->in.flags & (BASE_MEM_PROT_GPU_EX | BASE_MEM_GROW_ON_GPF)));
+      check(req->in.phandle);
+      check(*(const int *)(uintptr_t)req->in.phandle == IMPORT_FD);
+      mem_import_calls++;
+      if (fail_mem_import) {
+         errno = ENOMEM;
+         return -1;
+      }
+      req->out.flags = import_output_flags;
+      req->out.gpu_va = import_cookie;
+      req->out.va_pages = import_zero_pages ? 0 :
+                          import_output_pages ? import_output_pages : 1;
       return 0;
    }
    if (request == KBASE_IOCTL_MEM_SYNC) {
@@ -697,7 +730,6 @@ test_alloc_map_vm(void)
    check(pan_kmod_bo_munmap(bo, (char *)cached + bo->size, 1) == -1 && errno == EINVAL);
    check(munmap_calls == 1);
    check(!pan_kmod_bo_wait(bo, 0, false) && errno == ENOTSUP);
-   check(pan_kmod_bo_import(dev, FAKE_FD) == NULL && errno == ENOTSUP);
    check(pan_kmod_bo_export(bo) == -1 && errno == ENOTSUP);
 
    struct pan_kmod_vm *vm = pan_kmod_vm_create(dev, PAN_KMOD_VM_FLAG_AUTO_VA, 0, 0);
@@ -957,6 +989,72 @@ test_cache_sync(void)
 }
 
 static void
+test_import(void)
+{
+   reset_fake();
+   struct pan_kmod_dev *dev = create_device(0);
+   check(dev != NULL);
+
+   /* A dma-buf import becomes a GPU-visible BO with no CPU mapping. */
+   struct pan_kmod_bo *bo = pan_kmod_bo_import(dev, IMPORT_FD);
+   check(bo != NULL);
+   check(mem_import_calls == 1);
+   check(mmap_calls == 2); /* tracking page + cookie */
+   check(bo->size == PAGE_SIZE);
+   check(bo->flags & PAN_KMOD_BO_FLAG_IMPORTED);
+   check(bo->flags & PAN_KMOD_BO_FLAG_NO_MMAP);
+   check(pan_kmod_bo_mmap(bo, PROT_READ | PROT_WRITE, MAP_SHARED, NULL) == MAP_FAILED);
+   pan_kmod_bo_put(bo);
+   /* SAME_VA regions are torn down by munmap, never by MEM_FREE. */
+   check(munmap_calls == 1);
+   check(mem_free_calls == 0);
+
+   /* Import failure leaves nothing behind. */
+   reset_fake();
+   dev = create_device(0);
+   check(dev != NULL);
+   fail_mem_import = true;
+   check(pan_kmod_bo_import(dev, IMPORT_FD) == NULL);
+   check(mem_free_calls == 0);
+   check(munmap_calls == 0);
+
+   /* An output that fails validation cannot be trusted, so no MEM_FREE. */
+   reset_fake();
+   dev = create_device(0);
+   check(dev != NULL);
+   import_zero_pages = true;
+   check(pan_kmod_bo_import(dev, IMPORT_FD) == NULL && errno == EINVAL);
+   check(mem_free_calls == 0);
+
+   reset_fake();
+   dev = create_device(0);
+   check(dev != NULL);
+   import_output_flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR;
+   check(pan_kmod_bo_import(dev, IMPORT_FD) == NULL && errno == EINVAL);
+   check(mem_free_calls == 0);
+}
+
+static void
+test_perf_unsupported(void)
+{
+   reset_fake();
+   struct pan_kmod_dev *dev = create_device(0);
+   check(dev != NULL);
+   check(!pan_kmod_perf_create(dev));
+   check(errno == ENOTSUP);
+
+   /* The kbase backend leaves perf_enable/disable/dump/destroy unset, so the
+    * core wrappers must refuse instead of dereferencing a NULL op.
+    */
+   struct pan_kmod_perf_session session = {.dev = dev};
+   struct mali_perf_dump_info info;
+   check(pan_kmod_perf_enable(&session, NULL) == -1 && errno == ENOTSUP);
+   check(pan_kmod_perf_disable(&session) == -1 && errno == ENOTSUP);
+   pan_kmod_perf_dump(&session, &info);
+   pan_kmod_perf_destroy(&session);
+}
+
+static void
 test_g925_model(void)
 {
    uint8_t blob[128];
@@ -1037,6 +1135,8 @@ main(int argc, char **argv)
       test_alias();
       test_sync_provider();
       test_cache_sync();
+      test_import();
+      test_perf_unsupported();
       test_g925_model();
    }
    check(unexpected_calls == 0);

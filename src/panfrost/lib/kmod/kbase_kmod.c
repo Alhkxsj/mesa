@@ -424,10 +424,107 @@ kbase_kmod_bo_free(struct pan_kmod_bo *base)
 }
 
 static struct pan_kmod_bo *
-kbase_kmod_bo_import(UNUSED struct pan_kmod_dev *dev, UNUSED int fd)
+kbase_kmod_bo_import(struct pan_kmod_dev *base, int fd)
 {
-   errno = ENOTSUP;
+   if (!base->ops || base->ops != &kbase_kmod_ops || fd < 0) {
+      errno = EINVAL;
+      return NULL;
+   }
+
+   struct kbase_kmod_dev *dev = container_of(base, struct kbase_kmod_dev, base);
+   uint32_t previous;
+   do {
+      previous = p_atomic_read(&dev->next_handle);
+      if (previous == UINT32_MAX) {
+         errno = ENOSPC;
+         return NULL;
+      }
+   } while (p_atomic_cmpxchg(&dev->next_handle, previous, previous + 1) != previous);
+
+   struct kbase_kmod_bo *bo = pan_kmod_dev_alloc(base, sizeof(*bo));
+   if (!bo) {
+      errno = ENOMEM;
+      return NULL;
+   }
+
+   int handle_fd = fd;
+   union kbase_ioctl_mem_import req = {
+      .in = {
+         .flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR,
+         .phandle = (uintptr_t)&handle_fd,
+         .type = BASE_MEM_IMPORT_TYPE_UMM,
+      },
+   };
+   if (ioctl(base->fd, KBASE_IOCTL_MEM_IMPORT, &req))
+      goto error;
+
+   uint64_t cookie = req.out.gpu_va;
+   uint64_t pages = req.out.va_pages;
+   bool valid = cookie && cookie <= INT64_MAX &&
+                !(cookie & (KBASE_PAGE_SIZE - 1)) &&
+                pages && pages <= SIZE_MAX / KBASE_PAGE_SIZE &&
+                (req.out.flags & BASE_MEM_NEED_MMAP) &&
+                !(req.out.flags & (BASE_MEM_UNCACHED_GPU | BASE_MEM_PROT_GPU_EX));
+   if (!valid) {
+      /* The output is unverified, so we cannot tell whether the cookie belongs
+       * to this call.  Only local cleanup is safe.
+       */
+      errno = EINVAL;
+      goto error;
+   }
+
+   uint64_t size = pages * KBASE_PAGE_SIZE;
+   /* The cookie has to be mmap()ed to have the kernel place the region: only
+    * then does a real GPU VA exist, and for SAME_VA it equals the CPU VA.
+    *
+    * PROT_NONE is required: the kernel rejects a mapping whose VM_READ/VM_WRITE
+    * does not match the region's CPU_RD/CPU_WR flags, and importing with CPU
+    * access granted would be pointless anyway, because the fault handler
+    * refuses CPU faults on imported UMM mapped through a SAME_VA cookie
+    * ("Invalid CPU access to UMM memory").  The mapping is therefore never
+    * handed to callers (PAN_KMOD_BO_FLAG_NO_MMAP below); CPU access has to go
+    * through the dma-buf fd itself.
+    */
+   void *mapping = mmap(NULL, size, PROT_NONE, MAP_SHARED, base->fd, cookie);
+   if (mapping == MAP_FAILED)
+      goto error_free_import;
+   uintptr_t start = (uintptr_t)mapping;
+   if (!start || start > UINTPTR_MAX - (size - 1) ||
+       (start >> 32) != ((start + size - 1) >> 32)) {
+      if (munmap(mapping, size)) {
+         dev->alias_cleanup_uncertain = true;
+         errno = EIO;
+         goto error;
+      }
+      errno = EOVERFLOW;
+      goto error;
+   }
+
+   bo->cpu_ptr = mapping;
+   bo->gpu_va = start;
+   bo->same_va = true;
+   bo->memory_flags = req.out.flags;
+   pan_kmod_bo_init(&bo->base, base, NULL, size,
+                    PAN_KMOD_BO_FLAG_IMPORTED | PAN_KMOD_BO_FLAG_NO_MMAP,
+                    previous + 1);
+   return &bo->base;
+
+error_free_import:
+   /* The import already created the region; release it the same way bo_free
+    * does.  SAME_VA regions are torn down by munmap, not by MEM_FREE.
+    */
+   {
+      int error = errno;
+      struct kbase_ioctl_mem_free free_req = {.gpu_addr = cookie};
+      ioctl(base->fd, KBASE_IOCTL_MEM_FREE, &free_req);
+      errno = error;
+   }
+error: {
+   int error = errno;
+   pan_kmod_dev_free(base, bo);
+   errno = error;
    return NULL;
+   }
 }
 
 static int
