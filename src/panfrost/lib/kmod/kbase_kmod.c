@@ -415,7 +415,8 @@ kbase_kmod_bo_free(struct pan_kmod_bo *base)
 {
    struct kbase_kmod_bo *bo = container_of(base, struct kbase_kmod_bo, base);
    pan_kmod_bo_cleanup(base);
-   munmap(bo->cpu_ptr, base->size);
+   if (bo->cpu_ptr)
+      munmap(bo->cpu_ptr, base->size);
    if (!bo->same_va) {
       struct kbase_ioctl_mem_free req = {.gpu_addr = bo->gpu_va};
       ioctl(base->dev->fd, KBASE_IOCTL_MEM_FREE, &req);
@@ -463,7 +464,6 @@ kbase_kmod_bo_import(struct pan_kmod_dev *base, int fd)
    bool valid = cookie && cookie <= INT64_MAX &&
                 !(cookie & (KBASE_PAGE_SIZE - 1)) &&
                 pages && pages <= SIZE_MAX / KBASE_PAGE_SIZE &&
-                (req.out.flags & BASE_MEM_NEED_MMAP) &&
                 !(req.out.flags & (BASE_MEM_UNCACHED_GPU | BASE_MEM_PROT_GPU_EX));
    if (!valid) {
       /* The output is unverified, so we cannot tell whether the cookie belongs
@@ -474,35 +474,53 @@ kbase_kmod_bo_import(struct pan_kmod_dev *base, int fd)
    }
 
    uint64_t size = pages * KBASE_PAGE_SIZE;
-   /* The cookie has to be mmap()ed to have the kernel place the region: only
-    * then does a real GPU VA exist, and for SAME_VA it equals the CPU VA.
+   /* kbase_mem_import() has two shapes:
     *
-    * PROT_NONE is required: the kernel rejects a mapping whose VM_READ/VM_WRITE
-    * does not match the region's CPU_RD/CPU_WR flags, and importing with CPU
-    * access granted would be pointless anyway, because the fault handler
-    * refuses CPU faults on imported UMM mapped through a SAME_VA cookie
-    * ("Invalid CPU access to UMM memory").  The mapping is therefore never
-    * handed to callers (PAN_KMOD_BO_FLAG_NO_MMAP below); CPU access has to go
-    * through the dma-buf fd itself.
+    *  - NEED_MMAP/SAME_VA set: the returned value is a cookie, and the region
+    *    only enters GPU VA space once it is mmap()ed.  For a 64-bit client
+    *    this is the only shape that occurs, because kbase_mem_from_umm()
+    *    forces NEED_MMAP.
+    *  - otherwise the kernel reserved and mapped the region itself and the
+    *    returned value is already a real GPU VA.
     */
-   void *mapping = mmap(NULL, size, PROT_NONE, MAP_SHARED, base->fd, cookie);
-   if (mapping == MAP_FAILED)
-      goto error_free_import;
-   uintptr_t start = (uintptr_t)mapping;
-   if (!start || start > UINTPTR_MAX - (size - 1) ||
-       (start >> 32) != ((start + size - 1) >> 32)) {
-      if (munmap(mapping, size)) {
-         dev->alias_cleanup_uncertain = true;
-         errno = EIO;
+   if (req.out.flags & (BASE_MEM_NEED_MMAP | BASE_MEM_SAME_VA)) {
+      /* PROT_NONE is required, not merely preferable.  The mmap consistency
+       * check is "CPU_RD || !VM_READ" and "CPU_WR || !VM_WRITE", so a mapping
+       * with neither VM_READ nor VM_WRITE always passes, while asking for CPU
+       * access would demand CPU_RD/CPU_WR import flags that are themselves
+       * pointless here: the fault handler refuses CPU faults on imported UMM
+       * mapped through a cookie ("Invalid CPU access to UMM memory").
+       *
+       * The mapping exists only to make the kernel place the region; it is
+       * never handed to callers (PAN_KMOD_BO_FLAG_NO_MMAP below).  CPU access
+       * has to go through the dma-buf fd.
+       */
+      void *mapping = mmap(NULL, size, PROT_NONE, MAP_SHARED, base->fd, cookie);
+      if (mapping == MAP_FAILED)
+         goto error_free_import;
+      uintptr_t start = (uintptr_t)mapping;
+      if (!start || start > UINTPTR_MAX - (size - 1) ||
+          (start >> 32) != ((start + size - 1) >> 32)) {
+         if (munmap(mapping, size)) {
+            dev->alias_cleanup_uncertain = true;
+            errno = EIO;
+            goto error;
+         }
+         errno = EOVERFLOW;
          goto error;
       }
-      errno = EOVERFLOW;
-      goto error;
+      bo->cpu_ptr = mapping;
+      bo->gpu_va = start;
+      bo->same_va = true;
+   } else {
+      /* Real GPU VA, no CPU mapping at all, and the region is not torn down by
+       * munmap, so bo_free has to issue MEM_FREE.
+       */
+      bo->cpu_ptr = NULL;
+      bo->gpu_va = cookie;
+      bo->same_va = false;
    }
 
-   bo->cpu_ptr = mapping;
-   bo->gpu_va = start;
-   bo->same_va = true;
    bo->memory_flags = req.out.flags;
    pan_kmod_bo_init(&bo->base, base, NULL, size,
                     PAN_KMOD_BO_FLAG_IMPORTED | PAN_KMOD_BO_FLAG_NO_MMAP,
@@ -510,8 +528,8 @@ kbase_kmod_bo_import(struct pan_kmod_dev *base, int fd)
    return &bo->base;
 
 error_free_import:
-   /* The import already created the region; release it the same way bo_free
-    * does.  SAME_VA regions are torn down by munmap, not by MEM_FREE.
+   /* Only reachable from the cookie branch: the region exists but was never
+    * mapped, so MEM_FREE is the right way to release it.
     */
    {
       int error = errno;

@@ -1026,12 +1026,22 @@ test_import(void)
    check(pan_kmod_bo_import(dev, IMPORT_FD) == NULL && errno == EINVAL);
    check(mem_free_calls == 0);
 
+   /* Without NEED_MMAP/SAME_VA the kernel returns a real GPU VA and maps the
+    * region itself: no cookie, no placement mmap, and MEM_FREE on destroy.
+    */
    reset_fake();
    dev = create_device(0);
    check(dev != NULL);
    import_output_flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR;
-   check(pan_kmod_bo_import(dev, IMPORT_FD) == NULL && errno == EINVAL);
-   check(mem_free_calls == 0);
+   struct pan_kmod_bo *direct = pan_kmod_bo_import(dev, IMPORT_FD);
+   check(direct != NULL);
+   check(mem_import_calls == 1);
+   check(mmap_calls == 1); /* tracking page only */
+   check(direct->size == PAGE_SIZE);
+   pan_kmod_bo_put(direct);
+   check(mem_free_calls == 1);
+   /* No CPU mapping was ever created, so there is nothing to munmap. */
+   check(munmap_calls == 0);
 }
 
 static void
