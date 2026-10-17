@@ -1020,6 +1020,10 @@ pan_kmod_timestamp_cycles_to_ns(const struct pan_kmod_dev *dev,
 static inline struct pan_kmod_perf_session *
 pan_kmod_perf_create(struct pan_kmod_dev *dev)
 {
+   if (!dev->ops->perf_create) {
+      errno = ENOTSUP;
+      return NULL;
+   }
    return dev->ops->perf_create(dev);
 }
 
@@ -1027,12 +1031,20 @@ static inline int
 pan_kmod_perf_enable(struct pan_kmod_perf_session *session,
                      const struct pan_kmod_perf_config *cfg)
 {
+   if (!session->dev->ops->perf_enable) {
+      errno = ENOTSUP;
+      return -1;
+   }
    return session->dev->ops->perf_enable(session, cfg);
 }
 
 static inline int
 pan_kmod_perf_disable(struct pan_kmod_perf_session *session)
 {
+   if (!session->dev->ops->perf_disable) {
+      errno = ENOTSUP;
+      return -1;
+   }
    return session->dev->ops->perf_disable(session);
 }
 
@@ -1040,13 +1052,15 @@ static inline void
 pan_kmod_perf_dump(struct pan_kmod_perf_session *session,
                    struct mali_perf_dump_info *info)
 {
-   session->dev->ops->perf_dump(session, info);
+   if (session->dev->ops->perf_dump)
+      session->dev->ops->perf_dump(session, info);
 }
 
 static inline void
 pan_kmod_perf_destroy(struct pan_kmod_perf_session *session)
 {
-   session->dev->ops->perf_destroy(session);
+   if (session->dev->ops->perf_destroy)
+      session->dev->ops->perf_destroy(session);
 }
 
 static inline int
