@@ -102,6 +102,11 @@
 | 2026-10-18 | **kbase teardown 安全**：`destroy_gpu_queue()` 走 `panvk_device_uses_kbase()` 分支调 `kbase_compute_cleanup()`，**不经过** `cleanup_queue()`/`finish_render_desc_ringbuf()` ⇒ 那个会在 kbase 上误调 `panvk_as_free(alias_va)` 的路径**根本不可达**（该 VA 从未经 `panvk_as_alloc`） | 两条 destroy 路径分离 | `panvk_vX_gpu_queue.c:1520-1537` 的早期 return；`kbase_compute_cleanup` 全文 | 已验证（静态 + 97/97 回归） |
 | 2026-10-18 | **`addr.host` 在 kbase 上是"借来的只读视图"**，不能参与释放：backing 映射归 `kbase_kmod_bo_free()`（`munmap(cpu_ptr)`），alias 映射归 `kbase_kmod_alias_destroy()`（`munmap(mapping)`）。从 `addr.host` 再 munmap 会 **double-munmap** | 两处各自拥有自己的映射 | `kbase_kmod.c` 的 `bo_free` / `alias_destroy`；`kbase_compute_cleanup` 里显式清空 `addr.host` | 已验证（已按此实现） |
 
+| 2026-10-18 | **kbase 绘路径跳过的 5 处 heap 指令点**：全部由 `cmdbuf_skips_gpu_heap_ops()`（`panvk_vX_cmd_draw.c:57`，等价 `panvk_device_uses_kbase()`）门控 —— `:4236` `:4254`（`cs_vt_end`）、`:4534`（tiler OOM ctx + handler）、`:4561`（关 handler）、`:4671/:4674`（`cs_finish_fragment`） | kbase 只发 `VERTEX_TILER_STARTED`，不发 COMPLETED/FINISH_FRAGMENT，因此 heap 统计恒为 started-only —— 这是**有意设计**，因为内核在 chunk-grow 时对 `frag_end > vt_end` 或全零计数都杀组 | `panvk_vX_cmd_draw.c` 五处 + `docs`；`first-frame-prep-20261018/EXPERIMENT-CARD.md` | 已验证（静态） |
+| 2026-10-18 | **`panvk_kbase_compute_submit` 的 graphics 前置门控**：`graphics_ready` 不成立直接 `VK_ERROR_FEATURE_NOT_PRESENT`；成立则**先分配 replacement tiler heap** 再提交，并 rearm 两个 graphics 子队列的 noop stream | 首帧若报 `FEATURE_NOT_PRESENT`，先查这个门控，不是硬件问题 | `panvk_kbase_compute_queue.inc:358`（gate）、`:381-393`（rearm）、`:395+`（encode） | 已验证（静态） |
+| 2026-10-18 | **单元测试断言要挑 fixture 真有值的字段**：`desc_alias` 与 `tiler_heap.context` 在 `panvk_kbase_compute_queue_test.c` 的那个位置分别是 NULL / 0，拿它们做断言恒真、**oracle 不挂**。改用 `has_tiler_heap`（该点已建 heap）后 oracle 立即成立 | "断言 == 常量" 与 "断言 == 未初始化的镜像" 同样无效 | 三次 oracle 尝试：`graphics_ready`(恒 true)、`desc_alias`(两边 false)、`tiler_heap_context`(两边 0) 都没挂；`has_tiler_heap` 挂 | 已验证 |
+| 2026-10-18 | **meson 不把 `.inc` 当依赖**：改 `panvk_kbase_compute_queue.inc` 后 `ninja` 报 `no work to do`，测试仍是旧二进制 | `.inc` 被 `#include` 但不进依赖图 | 观察：改 `.inc` 后 ninja 无动作；`rm` 掉 `.o` 才重编 | 已验证（**改 `.inc` 后要 `rm` 对应 `.o` 或 `touch` 测试源**） |
+
 > M5a / M5b-1 真机实测硬件事实（设备身份、ioctl 观测、映射生命周期、用户提交的 kick）见
 > `/home/zl/github/mesa-port-backups/RE-NOTES.md` §8 与 §10；本台账不重复抄录。
 
