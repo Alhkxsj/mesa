@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <poll.h>
+
 #include "drm-uapi/panthor_drm.h"
 
 #include "genxml/cs_builder.h"

@@ -540,3 +540,29 @@ main(void)
 
    return 0;
 }
+
+/* KCPU probe stubs.  The probe is off unless PANVK_DEBUG=kcpu_event, but the
+ * submit path still references these, so the test needs definitions. */
+struct kbase_csf_kcpu { int unused; };
+struct kbase_csf_kcpu *
+kbase_csf_kcpu_create(struct kbase_csf_context *ctx)
+{
+   return NULL;
+}
+
+void
+kbase_csf_kcpu_destroy(struct kbase_csf_kcpu *kcpu)
+{
+}
+
+int
+kbase_csf_kcpu_cqs_wait(struct kbase_csf_kcpu *kcpu, uint64_t addr, uint32_t val)
+{
+   return -1;
+}
+
+int
+kbase_csf_kcpu_fence_signal(struct kbase_csf_kcpu *kcpu, int *fd)
+{
+   return -1;
+}

@@ -39,6 +39,7 @@ enum panvk_debug_flags {
    PANVK_DEBUG_ALIAS_WRITEBACK = 1 << 20,
    PANVK_DEBUG_FIRST_FRAME = 1 << 21,
    PANVK_DEBUG_ALIAS_GEOMETRY = 1 << 22,
+   PANVK_DEBUG_KCPU_EVENT = 1 << 23,
 };
 
 extern uint64_t panvk_debug;

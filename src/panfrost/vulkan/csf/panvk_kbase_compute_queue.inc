@@ -1,5 +1,7 @@
 #if defined(HAVE_PAN_KMOD_KBASE)
 
+#include <poll.h>
+
 struct kbase_compute_entry {
    uint64_t commands[128];
    uint32_t size;
@@ -69,6 +71,7 @@ static VkResult
 kbase_compute_execute(struct panvk_gpu_queue *queue,
                         const struct kbase_compute_entry *entries, uint32_t count)
 {
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct kbase_csf_submit_entry submit[PANVK_SUBQUEUE_COUNT];
    struct kbase_csf_queue *queues[PANVK_SUBQUEUE_COUNT];
    uint64_t targets[PANVK_SUBQUEUE_COUNT];
@@ -83,13 +86,67 @@ kbase_compute_execute(struct panvk_gpu_queue *queue,
          .size = entries[i].size, .target = targets[i],
       };
    }
-   if (kbase_csf_submit(submit, count))
+   /* KCPU completion probe.
+    *
+    * The compute stream already ends with SYNC_ADD64 of +1 at the queue's
+    * seqno address, and kbase_csf_wait() below polls that same word from the
+    * CPU.  Parking a KCPU CQS wait on it asks the kernel's own event path the
+    * same question, which is the mechanism a real completion signal needs.
+    *
+    * The wait and the fence signal go on a separate KCPU queue from the
+    * submission: a CQS wait cannot be released by anything queued behind it.
+    */
+   struct kbase_csf_kcpu *kcpu_probe = NULL;
+   int kcpu_probe_fd = -1;
+   if (PANVK_DEBUG(KCPU_EVENT) && count == 1 &&
+       entries[0].subqueue == PANVK_SUBQUEUE_COMPUTE) {
+      uint64_t seqno_va = kbase_csf_queue_seqno_va(queues[0]);
+      uint64_t expect = targets[0] - 1;
+      kcpu_probe = kbase_csf_kcpu_create(dev->kbase.ctx);
+      if (!kcpu_probe) {
+         fprintf(stderr, "KBASE_KCPU_EVENT_RESULT stage=create_failed errno=%d\n",
+                 errno);
+      } else if (kbase_csf_kcpu_cqs_wait(kcpu_probe, seqno_va, expect)) {
+         fprintf(stderr, "KBASE_KCPU_EVENT_RESULT stage=wait_failed errno=%d\n",
+                 errno);
+         kbase_csf_kcpu_destroy(kcpu_probe);
+         kcpu_probe = NULL;
+      } else if (kbase_csf_kcpu_fence_signal(kcpu_probe, &kcpu_probe_fd)) {
+         fprintf(stderr, "KBASE_KCPU_EVENT_RESULT stage=signal_failed errno=%d\n",
+                 errno);
+         kbase_csf_kcpu_destroy(kcpu_probe);
+         kcpu_probe = NULL;
+      } else {
+         fprintf(stderr, "KBASE_KCPU_EVENT_ARMED seqno=0x%016" PRIx64
+                         " expect=%" PRIu64 " fd=%d\n",
+                 seqno_va, expect, kcpu_probe_fd);
+      }
+   }
+
+   if (kbase_csf_submit(submit, count)) {
+      if (kcpu_probe)
+         kbase_csf_kcpu_destroy(kcpu_probe);
       return vk_queue_set_lost(&queue->vk, "kbase submission failed");
+   }
    for (uint32_t i = 0; i < count; i++)
       queue->kbase.targets[entries[i].subqueue] = targets[i];
    uint64_t deadline = os_time_get_nano() + 5000000000ull;
-   if (kbase_csf_wait(queues, count, targets, deadline) != 1)
+   if (kbase_csf_wait(queues, count, targets, deadline) != 1) {
+      if (kcpu_probe)
+         kbase_csf_kcpu_destroy(kcpu_probe);
       return vk_queue_set_lost(&queue->vk, "kbase completion failed");
+   }
+
+   if (kcpu_probe) {
+      struct pollfd pfd = {.fd = kcpu_probe_fd, .events = POLLIN};
+      int ready = poll(&pfd, 1, 2000);
+      fprintf(stderr, "KBASE_KCPU_EVENT_RESULT ready=%d revents=0x%x "
+                      "target=%" PRIu64 "\n",
+              ready, ready > 0 ? pfd.revents : 0, targets[0]);
+      close(kcpu_probe_fd);
+      kcpu_probe_fd = -1;
+      kbase_csf_kcpu_destroy(kcpu_probe);
+   }
 
    /* Probe readback: with PANVK_DEBUG=alias_writeback the compute stream also
     * wrote a known value into the second alias entry.  The alias repeats one
