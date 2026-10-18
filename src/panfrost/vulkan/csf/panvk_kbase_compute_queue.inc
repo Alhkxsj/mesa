@@ -504,8 +504,12 @@ kbase_compute_submit(struct panvk_gpu_queue *queue, struct vk_queue_submit *subm
    struct kbase_kmod_heap *replacement = NULL;
    if (graphics) {
       replacement = kbase_graphics_heap_create(queue);
-      if (!replacement)
+      if (!replacement) {
+         if (PANVK_DEBUG(FIRST_FRAME))
+            fprintf(stderr, "KBASE_FIRST_FRAME_HEAP_FAIL errno=%d (%s)\n",
+                    errno, strerror(errno));
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      }
    }
    uint32_t wave_count = submit->command_buffer_count;
    struct kbase_compute_entry *entries = wave_count ?

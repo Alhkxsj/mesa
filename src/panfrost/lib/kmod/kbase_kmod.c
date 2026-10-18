@@ -813,8 +813,13 @@ kbase_kmod_heap_create(struct pan_kmod_dev *base, uint32_t chunk_size,
    }
    uint64_t context = req.out.gpu_heap_va;
    uint64_t first_chunk = req.out.first_chunk_va;
-   if (!context || !first_chunk || (context & (KBASE_PAGE_SIZE - 1)) ||
-       (first_chunk & (KBASE_PAGE_SIZE - 1)) ||
+   /* The heap context VA is not page aligned and must not be required to be.
+    * kbase hands out a slot inside a shared context pool, spaced by
+    * HEAP_CTX_SIZE (32) rounded up to the GPU cache line, so the second and
+    * later heaps in a context land on non-page offsets. Only the chunk
+    * address, which is a real mapping, has to be page aligned.
+    */
+   if (!context || !first_chunk || (first_chunk & (KBASE_PAGE_SIZE - 1)) ||
        first_chunk > UINT64_MAX - chunk_size) {
       int error = EINVAL;
       struct kbase_ioctl_cs_tiler_heap_term term_req = {.gpu_heap_va = context};

@@ -852,10 +852,24 @@ test_jit_heap(void)
    check(!kbase_kmod_heap_create(dev, PAGE_SIZE, 3, 2, 1, 0));
    check(!kbase_kmod_heap_create(dev, PAGE_SIZE, 1, 2, 65536, 0));
    check(!kbase_kmod_heap_create(dev, PAGE_SIZE, 1, 2, 1, 256));
-   check(heap_init_calls == 1);
+
+   /* kbase hands out heap contexts from a shared pool, spaced by HEAP_CTX_SIZE
+    * (32) rounded up to the GPU cache line. Only the first slot in a context is
+    * page aligned; a second heap lands on a 64-byte offset. Rejecting that
+    * would break every graphics submission after the first. */
+   heap_context = 0x90000040ull;
+   heap_first_chunk = 0x90100000ull;
+   struct kbase_kmod_heap *heap2 =
+      kbase_kmod_heap_create(dev, PAGE_SIZE, 1, 2, 1, 0);
+   check(heap2 && kbase_kmod_heap_context(heap2) == 0x90000040ull);
+   check(kbase_kmod_heap_destroy(heap2) == 0);
+   heap_context = 0x90000000ull;
+   heap_first_chunk = 0x90100000ull;
+
+   check(heap_init_calls == 2);
    heap_first_chunk++;
    check(!kbase_kmod_heap_create(dev, PAGE_SIZE, 1, 2, 1, 0) && errno == EINVAL);
-   check(heap_init_calls == 2 && heap_term_calls == 3);
+   check(heap_init_calls == 3 && heap_term_calls == 4);
    heap_first_chunk--;
    check(kbase_kmod_heap_context(NULL) == 0 && kbase_kmod_heap_first_chunk(NULL) == 0);
    kbase_kmod_ops.dev_destroy(dev);
