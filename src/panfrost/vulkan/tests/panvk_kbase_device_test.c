@@ -199,9 +199,13 @@ test_policy(void)
    memset(&features, 0xff, sizeof(features));
    panvk_kbase_physical_device_capabilities(&ext, &features);
    const struct vk_device_extension_table no_ext = {0};
-   const struct vk_features no_features = {0};
    assert(!memcmp(&ext, &no_ext, sizeof(ext)));
-   assert(!memcmp(&features, &no_features, sizeof(features)));
+   /* Only features with a hardware check behind them are declared; everything
+    * else must stay off. */
+   const struct vk_features kbase_features = {
+      .samplerAnisotropy = true,
+   };
+   assert(!memcmp(&features, &kbase_features, sizeof(features)));
    struct vk_properties props = {.apiVersion = VK_API_VERSION_1_4,
       .timestampComputeAndGraphics = true, .timestampPeriod = 10,
       .conformanceVersion = {1, 4, 1, 2}};

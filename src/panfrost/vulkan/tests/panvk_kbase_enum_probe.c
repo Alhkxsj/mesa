@@ -1512,6 +1512,10 @@ run_probe(const char *library, bool live, bool csf_mode, bool memory_mode, bool 
          for (unsigned i = 0; i < sizeof(features) / sizeof(VkBool32); i++)
             optional += ((VkBool32 *)&features)[i] != 0;
          printf("CAPABILITIES optional_core_features=%u memory_heaps=%u memory_types=%u\n", optional, memory.memoryHeapCount, memory.memoryTypeCount);
+         /* samplerAnisotropy is declared only because a hardware probe showed
+          * the filtering actually happens; nothing else is declared yet. */
+         CHECK(features.samplerAnisotropy);
+         optional -= 1;
          uint32_t family_count = 0;
          GetPhysicalDeviceQueueFamilyProperties(physical, &family_count, NULL);
          CHECK(family_count <= 4);

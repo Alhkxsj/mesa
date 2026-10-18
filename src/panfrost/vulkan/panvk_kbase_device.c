@@ -90,8 +90,16 @@ panvk_kbase_physical_device_capabilities(struct vk_device_extension_table *exten
 {
    if (extensions)
       *extensions = (struct vk_device_extension_table){0};
-   if (features)
-      *features = (struct vk_features){0};
+   if (features) {
+      *features = (struct vk_features){
+         /* Verified on hardware: an isotropic sampler averages a one-texel
+          * stripe texture to flat grey while the anisotropic sampler keeps
+          * the full range, so the difference is the filtering and not a
+          * missing sample. See s10-aniso-20261018.
+          */
+         .samplerAnisotropy = true,
+      };
+   }
 }
 
 void
