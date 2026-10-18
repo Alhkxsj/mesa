@@ -807,6 +807,9 @@ install_guard(unsigned stage)
             KBASE_IOCTL_CS_QUEUE_BIND, KBASE_IOCTL_CS_QUEUE_KICK, KBASE_IOCTL_CS_QUEUE_TERMINATE,
             KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE, KBASE_IOCTL_CS_TILER_HEAP_INIT,
             KBASE_IOCTL_CS_TILER_HEAP_TERM,
+            /* Needed by the dma-buf cache-coherence probe: import a buffer the
+             * GPU wrote into, then MEM_SYNC it before reading. */
+            KBASE_IOCTL_MEM_IMPORT,
          };
          for (unsigned i = 0; i < sizeof(device_requests) / sizeof(device_requests[0]); i++) {
             JUMP(&b, BPF_JMP | BPF_JEQ | BPF_K, device_requests[i], 0, 1);
