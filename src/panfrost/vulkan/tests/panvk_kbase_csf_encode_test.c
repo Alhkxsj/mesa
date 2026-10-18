@@ -105,5 +105,32 @@ main(void)
    info.stream_address = UINT64_C(0x1000000000030000);
    info.seqno_address = UINT64_C(0x1000000000040000);
    assert(ENCODE_NAME(PAN_ARCH)(&info, commands, sizeof(commands), &size));
+   unsigned baseline_size = size;
+
+   /* Optional probe writeback: a second SYNC_ADD64 must be appended before the
+    * error barrier, and the stream must still be well formed. */
+   info.probe_address = UINT64_C(0x500000);
+   info.probe_value = UINT64_C(0x1122334455667788);
+   assert(ENCODE_NAME(PAN_ARCH)(&info, commands, sizeof(commands), &size));
+   assert(size > baseline_size);
+   assert((commands[size / 8 - 1] >> 56) == MALI_CS_OPCODE_ERROR_BARRIER);
+
+   unsigned add64_count = 0;
+   for (unsigned i = 0; i < size / 8; i++) {
+      if ((commands[i] >> 56) != MALI_CS_OPCODE_SYNC_ADD64)
+         continue;
+      struct MALI_CS_SYNC_ADD64 packet;
+      MALI_CS_SYNC_ADD64_unpack(
+         (const struct mali_cs_sync_add64_packed *)&commands[i], &packet);
+      assert(packet.error_propagate && packet.scope == MALI_CS_SYNC_SCOPE_SYSTEM);
+      add64_count++;
+   }
+   assert(add64_count == 2);
+
+   /* With the probe disabled again the stream must return to its baseline. */
+   info.probe_address = 0;
+   info.probe_value = 0;
+   assert(ENCODE_NAME(PAN_ARCH)(&info, commands, sizeof(commands), &size));
+   assert(size == baseline_size);
    return 0;
 }

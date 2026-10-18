@@ -21,6 +21,14 @@ struct panvk_kbase_csf_encode_info {
    uint32_t stream_size;
    uint32_t flush_id;
    uint64_t seqno_address;
+   /* Optional GPU writeback probe.  When probe_address is non-zero the stream
+    * also performs a SYNC_ADD64 of probe_value at that address.  Used to make
+    * the GPU prove it can reach a given address, in particular the aliased
+    * ring window, which is not proven end to end yet.  Zero disables it and
+    * leaves the production stream unchanged.
+    */
+   uint64_t probe_address;
+   uint64_t probe_value;
 };
 
 typedef bool (*panvk_kbase_csf_encode_func)(

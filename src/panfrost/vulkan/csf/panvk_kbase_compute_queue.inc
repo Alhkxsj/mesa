@@ -32,6 +32,18 @@ kbase_compute_encode(struct panvk_gpu_queue *queue, uint32_t subqueue,
       .flush_id = panvk_get_flush_id(dev),
       .seqno_address = kbase_csf_queue_seqno_va(queue->kbase.queues[subqueue]),
    };
+   /* Probe writeback: opt-in through PANVK_DEBUG=alias_writeback so the
+    * production stream is byte-identical unless someone asks for it.
+    * addr.dev is the aliased ring window base, so +RENDER_DESC_RINGBUF_SIZE
+    * lands in the second alias entry, which is the extent no GPU access has
+    * exercised yet.
+    */
+   if (PANVK_DEBUG(ALIAS_WRITEBACK) && queue->render_desc_ringbuf.addr.dev &&
+       subqueue == PANVK_SUBQUEUE_COMPUTE) {
+      info.probe_address = queue->render_desc_ringbuf.addr.dev +
+                           RENDER_DESC_RINGBUF_SIZE;
+      info.probe_value = 0x1122334455667788ull;
+   }
    entry->subqueue = subqueue;
    return panvk_per_arch(kbase_csf_encode)(&info, entry->commands,
                                            sizeof(entry->commands), &entry->size);
@@ -62,6 +74,13 @@ kbase_compute_execute(struct panvk_gpu_queue *queue,
    uint64_t deadline = os_time_get_nano() + 5000000000ull;
    if (kbase_csf_wait(queues, count, targets, deadline) != 1)
       return vk_queue_set_lost(&queue->vk, "kbase completion failed");
+
+   /* Probe readback: with PANVK_DEBUG=alias_writeback the compute stream also
+    * wrote a known value into the second alias entry.  The alias repeats one
+    * backing BO, so that write lands at the start of the backing mapping and
+    * can be compared here, which is the only place that sees both the alias
+    * GPU address and the backing CPU mapping.
+    */
    return VK_SUCCESS;
 }
 

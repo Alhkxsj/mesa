@@ -147,6 +147,18 @@ panvk_kbase_csf_encode(const struct panvk_kbase_csf_encode_info *info,
    kbase_move64_to(&b, val64, 1);
    cs_sync64_add(&b, true, MALI_CS_SYNC_SCOPE_SYSTEM, val64, addr64,
                  cs_defer(0, info->deferred_slot));
+
+   /* Optional probe writeback.  A plain SYNC_ADD64 has no condition and never
+    * blocks, so this cannot hang the queue; if the address is not mapped the
+    * MMU fault is reported through the usual error path.
+    */
+   if (info->probe_address) {
+      kbase_move64_to(&b, addr64, info->probe_address);
+      kbase_move64_to(&b, val64, info->probe_value);
+      cs_sync64_add(&b, true, MALI_CS_SYNC_SCOPE_SYSTEM, val64, addr64,
+                    cs_defer(0, info->deferred_slot));
+   }
+
    cs_error_barrier(&b);
    cs_end(&b);
 
