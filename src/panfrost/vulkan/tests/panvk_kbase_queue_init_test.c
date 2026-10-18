@@ -426,6 +426,13 @@ kbase_kmod_alias_gpu_va(struct kbase_kmod_alias *alias)
    return alias->address;
 }
 
+uint64_t
+kbase_kmod_bo_gpu_va(struct pan_kmod_bo *bo)
+{
+   struct allocation *alloc = find_bo(bo);
+   return (uintptr_t)alloc->host;
+}
+
 void
 pan_kmod_queue_bo_map_sync(struct pan_kmod_bo *bo, uint64_t offset,
                            void *ptr, uint64_t size, enum pan_kmod_bo_sync_type type)

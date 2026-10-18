@@ -77,10 +77,23 @@ kbase_compute_execute(struct panvk_gpu_queue *queue,
 
    /* Probe readback: with PANVK_DEBUG=alias_writeback the compute stream also
     * wrote a known value into the second alias entry.  The alias repeats one
-    * backing BO, so that write lands at the start of the backing mapping and
-    * can be compared here, which is the only place that sees both the alias
-    * GPU address and the backing CPU mapping.
+    * backing BO, so that write lands at the start of the backing mapping, and
+    * addr.host points exactly there.  A match proves the GPU resolved the
+    * second entry to the expected physical page.
+    *
+    * The same execute path also runs the queue's init stream, which carries no
+    * probe write, so the first observation legitimately reads zero.  Report
+    * each one and let the last submission be the one that must match.
     */
+   if (PANVK_DEBUG(ALIAS_WRITEBACK) && queue->render_desc_ringbuf.addr.host) {
+      const uint64_t expected = 0x1122334455667788ull;
+      const uint64_t observed =
+         *(volatile uint64_t *)queue->render_desc_ringbuf.addr.host;
+      fprintf(stderr, "KBASE_ALIAS_WRITEBACK_RESULT expected=0x%016" PRIx64
+                      " observed=0x%016" PRIx64 " match=%u\n",
+              expected, observed, observed == expected);
+      fflush(stderr);
+   }
    return VK_SUCCESS;
 }
 
@@ -126,6 +139,11 @@ kbase_compute_cleanup(struct panvk_gpu_queue *queue)
       pan_kmod_bo_put(queue->render_desc_ringbuf.bo);
       queue->render_desc_ringbuf.bo = NULL;
    }
+   /* addr.host is a borrowed view of the backing mapping, not an owned one:
+    * bo_free() and kbase_kmod_alias_destroy() already released it.  Clear it
+    * so nothing downstream tries to unmap through it.
+    */
+   queue->render_desc_ringbuf.addr.host = NULL;
    panvk_pool_free_mem(&queue->tiler_heap.desc);
    panvk_pool_free_mem(&queue->tiler_heap.oom_fbd);
    if (queue->kbase.init_stream) {
@@ -179,6 +197,18 @@ kbase_graphics_resources(struct panvk_gpu_queue *queue)
    if (!queue->kbase.desc_alias)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    ring->addr.dev = kbase_kmod_alias_gpu_va(queue->kbase.desc_alias);
+   /* SAME_VA makes the backing BO's CPU mapping address equal to its GPU
+    * address.  Record it so the window can be inspected from the driver, and
+    * so a debug probe has something to compare against.
+    *
+    * Read-only by contract: the backing mapping is owned by bo_free and the
+    * alias mapping is owned by kbase_kmod_alias_destroy(), both of which
+    * munmap it themselves.  kbase_compute_cleanup() therefore clears this
+    * field instead of unmapping through it, which would double-munmap.
+    */
+   ring->addr.host = kbase_kmod_bo_gpu_va(ring->bo) ?
+                        (void *)(uintptr_t)kbase_kmod_bo_gpu_va(ring->bo) :
+                        NULL;
    alloc = (struct panvk_pool_alloc_info){.size = sizeof(struct panvk_cs_sync32),
                                           .alignment = 64};
    ring->syncobj = panvk_pool_alloc_mem(&dev->mempools.rw, alloc);

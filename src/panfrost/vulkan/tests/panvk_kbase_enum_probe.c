@@ -1367,7 +1367,17 @@ run_probe(const char *library, bool live, bool csf_mode, bool memory_mode, bool 
    setenv("PANVK_KBASE_DEVICE", "/dev/mali0", 1);
    setenv("PAN_KMOD_RESTRICT_TO_BACKENDS", "kbase", 1);
    setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
-   unsetenv("PANVK_DEBUG");
+   /* The probe pins PANVK_DEBUG off so baselines stay reproducible.  A caller
+    * that explicitly wants driver-side debug categories (for example the
+    * alias_writeback probe) passes them through PANVK_KBASE_PROBE_DEBUG, which
+    * keeps the default isolated while making the choice visible at the call
+    * site.
+    */
+   const char *probe_debug = getenv("PANVK_KBASE_PROBE_DEBUG");
+   if (probe_debug && *probe_debug)
+      setenv("PANVK_DEBUG", probe_debug, 1);
+   else
+      unsetenv("PANVK_DEBUG");
    void *icd = dlopen(library, RTLD_NOW | RTLD_LOCAL);
    if (!icd) {
       fprintf(stderr, "dlopen failed: %s\n", dlerror());
