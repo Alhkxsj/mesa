@@ -530,6 +530,28 @@ struct base_kcpu_command_fence_info {
    __u64 fence;
 };
 
+struct base_cqs_wait_info {
+   __u64 addr;
+   __u32 val;
+   __u32 padding;
+};
+
+struct base_kcpu_command_cqs_wait_info {
+   __u64 objs;
+   __u32 nr_objs;
+   __u32 inherit_err_flags;
+};
+
+struct base_cqs_set {
+   __u64 addr;
+};
+
+struct base_kcpu_command_cqs_set_info {
+   __u64 objs;
+   __u32 nr_objs;
+   __u32 padding;
+};
+
 struct base_cqs_wait_operation_info {
    __u64 addr;
    __u64 val;
@@ -549,6 +571,8 @@ struct base_kcpu_command {
    __u8 padding[7];
    union {
       struct base_kcpu_command_fence_info fence;
+      struct base_kcpu_command_cqs_wait_info cqs_wait;
+      struct base_kcpu_command_cqs_set_info cqs_set;
       struct base_kcpu_command_cqs_wait_operation_info cqs_wait_operation;
       __u64 padding[2];
    } info;

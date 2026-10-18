@@ -1025,3 +1025,117 @@ kbase_csf_wait(struct kbase_csf_queue *const *queues, uint32_t count,
       mtx_unlock(&ctx->reader_lock);
    }
 }
+
+/* KCPU command queue.
+ *
+ * The kernel processes a KCPU queue with a dedicated worker. Commands are
+ * copied out of userspace at enqueue time, so the staging array only needs to
+ * live for the duration of the ioctl.
+ *
+ * The Base interface accepts exactly one command per enqueue; ordering across
+ * commands is provided by the queue itself.
+ */
+struct kbase_csf_kcpu {
+   struct kbase_csf_context *ctx;
+   base_kcpu_queue_id id;
+};
+
+struct kbase_csf_kcpu *
+kbase_csf_kcpu_create(struct kbase_csf_context *ctx)
+{
+   if (!ctx) {
+      errno = EINVAL;
+      return NULL;
+   }
+
+   struct kbase_csf_kcpu *kcpu = calloc(1, sizeof(*kcpu));
+   if (!kcpu)
+      return NULL;
+
+   struct kbase_ioctl_kcpu_queue_new req = {0};
+   if (csf_ioctl(ctx, KBASE_IOCTL_KCPU_QUEUE_CREATE, &req)) {
+      int error = errno;
+      free(kcpu);
+      errno = error;
+      return NULL;
+   }
+
+   kcpu->ctx = ctx;
+   kcpu->id = req.id;
+   return kcpu;
+}
+
+void
+kbase_csf_kcpu_destroy(struct kbase_csf_kcpu *kcpu)
+{
+   if (!kcpu)
+      return;
+
+   struct kbase_ioctl_kcpu_queue_delete req = {.id = kcpu->id};
+   csf_ioctl(kcpu->ctx, KBASE_IOCTL_KCPU_QUEUE_DELETE, &req);
+   free(kcpu);
+}
+
+int
+kbase_csf_kcpu_enqueue(struct kbase_csf_kcpu *kcpu,
+                       struct base_kcpu_command *command)
+{
+   if (!kcpu || !command) {
+      errno = EINVAL;
+      return -1;
+   }
+
+   struct kbase_ioctl_kcpu_queue_enqueue req = {
+      .addr = (uint64_t)(uintptr_t)command,
+      .nr_commands = 1,
+      .id = kcpu->id,
+   };
+
+   return csf_ioctl(kcpu->ctx, KBASE_IOCTL_KCPU_QUEUE_ENQUEUE, &req);
+}
+
+int
+kbase_csf_kcpu_fence_signal(struct kbase_csf_kcpu *kcpu, int *fd)
+{
+   if (!kcpu || !fd) {
+      errno = EINVAL;
+      return -1;
+   }
+
+   struct base_fence fence = {.basep.fd = -1, .basep.stream_fd = -1};
+   struct base_kcpu_command command = {
+      .type = BASE_KCPU_COMMAND_TYPE_FENCE_SIGNAL,
+      .info.fence.fence = (uint64_t)(uintptr_t)&fence,
+   };
+
+   if (kbase_csf_kcpu_enqueue(kcpu, &command))
+      return -1;
+
+   if (fence.basep.fd < 0) {
+      errno = EPROTO;
+      return -1;
+   }
+
+   *fd = fence.basep.fd;
+   return 0;
+}
+
+int
+kbase_csf_kcpu_cqs_wait(struct kbase_csf_kcpu *kcpu, uint64_t addr, uint32_t val)
+{
+   if (!kcpu) {
+      errno = EINVAL;
+      return -1;
+   }
+
+   struct base_cqs_wait_info wait = {.addr = addr, .val = val};
+   struct base_kcpu_command command = {
+      .type = BASE_KCPU_COMMAND_TYPE_CQS_WAIT,
+      .info.cqs_wait = {
+         .objs = (uint64_t)(uintptr_t)&wait,
+         .nr_objs = 1,
+      },
+   };
+
+   return kbase_csf_kcpu_enqueue(kcpu, &command);
+}

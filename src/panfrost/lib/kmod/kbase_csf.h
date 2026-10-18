@@ -2,6 +2,7 @@
 #define KBASE_CSF_H
 
 #include "pan_kmod.h"
+#include "drm-uapi/mali_kbase_ioctl.h"
 
 struct drm_panthor_csif_info;
 
@@ -51,5 +52,29 @@ int kbase_csf_publish(struct kbase_csf_queue *const *queues, uint32_t count);
 int kbase_csf_submit(const struct kbase_csf_submit_entry *entries, uint32_t count);
 int kbase_csf_wait(struct kbase_csf_queue *const *queues, uint32_t count,
                    const uint64_t *targets, uint64_t abs_timeout_ns);
+
+/* KCPU command queue.
+ *
+ * A KCPU queue is a separate kernel-side worker that executes commands
+ * submitted from userspace: signalling a fence, waiting on a location, and
+ * so on. It is independent of the CS queues above; nothing is enqueued until
+ * kbase_csf_kcpu_enqueue() is called.
+ */
+struct kbase_csf_kcpu;
+
+struct kbase_csf_kcpu *kbase_csf_kcpu_create(struct kbase_csf_context *ctx);
+void kbase_csf_kcpu_destroy(struct kbase_csf_kcpu *kcpu);
+
+int kbase_csf_kcpu_enqueue(struct kbase_csf_kcpu *kcpu,
+                           struct base_kcpu_command *command);
+
+/* Enqueue a fence-signal command. On success *fd receives a sync_file
+ * descriptor that becomes readable once the command is executed. */
+int kbase_csf_kcpu_fence_signal(struct kbase_csf_kcpu *kcpu, int *fd);
+
+/* Enqueue a CQS wait: block the queue until *(uint32_t *)addr > val.
+ * addr must be the GPU VA of a CSF event BO. */
+int kbase_csf_kcpu_cqs_wait(struct kbase_csf_kcpu *kcpu, uint64_t addr,
+                            uint32_t val);
 
 #endif

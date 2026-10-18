@@ -83,6 +83,14 @@ static bool check_batch_inserts;
 static unsigned call_log[4096], call_log_count;
 enum { LOG_SYNC = 1, LOG_KICK = 2, LOG_QUEUE_TERM = 3, LOG_GROUP_TERM = 4 };
 
+static unsigned kcpu_create_calls, kcpu_delete_calls, kcpu_enqueue_calls;
+static bool fail_kcpu_create, fail_kcpu_enqueue;
+static uint8_t kcpu_id = 3;
+static uint8_t last_kcpu_type;
+static uint64_t last_cqs_addr;
+static uint32_t last_cqs_val;
+static int kcpu_fence_fd = 99;
+
 static void
 put_le(uint8_t *dst, uint64_t value, unsigned size)
 {
@@ -133,6 +141,10 @@ reset_fake(void)
    memset(user_ios, 0, sizeof(user_ios));
    user_io_count = 0; check_batch_inserts = false;
    call_log_count = 0; make_props();
+   kcpu_create_calls = kcpu_delete_calls = kcpu_enqueue_calls = 0;
+   fail_kcpu_create = fail_kcpu_enqueue = false;
+   kcpu_id = 3; last_kcpu_type = 0; last_cqs_addr = 0; last_cqs_val = 0;
+   kcpu_fence_fd = 99;
 }
 static void *test_zalloc(const struct pan_kmod_allocator *a, size_t s, bool t) { return calloc(1, s); }
 static void test_free(const struct pan_kmod_allocator *a, void *p) { free(p); }
@@ -256,6 +268,38 @@ __wrap_ioctl(int fd, unsigned long request, ...)
       }
       kick_calls++; call_log[call_log_count++] = LOG_KICK;
       if (fail_kick) { errno = EIO; return -1; } return 0;
+   }
+   if (request == KBASE_IOCTL_KCPU_QUEUE_CREATE) {
+      struct kbase_ioctl_kcpu_queue_new *r = arg;
+      kcpu_create_calls++;
+      if (fail_kcpu_create) { errno = ENOMEM; return -1; }
+      r->id = kcpu_id; return 0;
+   }
+   if (request == KBASE_IOCTL_KCPU_QUEUE_DELETE) {
+      struct kbase_ioctl_kcpu_queue_delete *r = arg;
+      kcpu_delete_calls++;
+      check(r->id == kcpu_id);
+      return 0;
+   }
+   if (request == KBASE_IOCTL_KCPU_QUEUE_ENQUEUE) {
+      struct kbase_ioctl_kcpu_queue_enqueue *r = arg;
+      kcpu_enqueue_calls++;
+      check(r->id == kcpu_id && r->nr_commands == 1 && r->addr);
+      struct base_kcpu_command *cmd = (void *)(uintptr_t)r->addr;
+      last_kcpu_type = cmd->type;
+      if (cmd->type == BASE_KCPU_COMMAND_TYPE_FENCE_SIGNAL) {
+         struct base_fence *f = (void *)(uintptr_t)cmd->info.fence.fence;
+         check(f);
+         f->basep.fd = kcpu_fence_fd; f->basep.stream_fd = -1;
+      } else if (cmd->type == BASE_KCPU_COMMAND_TYPE_CQS_WAIT) {
+         struct base_cqs_wait_info *w = (void *)(uintptr_t)cmd->info.cqs_wait.objs;
+         check(w && cmd->info.cqs_wait.nr_objs == 1);
+         last_cqs_addr = w->addr; last_cqs_val = w->val;
+      } else {
+         check(!"unexpected kcpu command type");
+      }
+      if (fail_kcpu_enqueue) { errno = EINVAL; return -1; }
+      return 0;
    }
    unexpected_calls++; errno = ENOTTY; return -1;
 }
@@ -649,6 +693,110 @@ test_sync_failure_and_wrap_padding(void)
    finish_context(ctx, dev);
 }
 
+static void
+test_kcpu_create_delete(void)
+{
+   reset_fake();
+   struct pan_kmod_dev *dev = NULL;
+   struct kbase_csf_context *ctx = create_context(&dev);
+   check(ctx);
+
+   struct kbase_csf_kcpu *kcpu = kbase_csf_kcpu_create(ctx);
+   check(kcpu);
+   check(kcpu_create_calls == 1 && kcpu_delete_calls == 0);
+
+   kbase_csf_kcpu_destroy(kcpu);
+   check(kcpu_delete_calls == 1);
+
+   /* NULL is a no-op, not a crash. */
+   kbase_csf_kcpu_destroy(NULL);
+
+   finish_context(ctx, dev);
+}
+
+static void
+test_kcpu_fence_signal(void)
+{
+   reset_fake();
+   struct pan_kmod_dev *dev = NULL;
+   struct kbase_csf_context *ctx = create_context(&dev);
+   check(ctx);
+   struct kbase_csf_kcpu *kcpu = kbase_csf_kcpu_create(ctx);
+   check(kcpu);
+
+   int fd = -1;
+   check(kbase_csf_kcpu_fence_signal(kcpu, &fd) == 0);
+   check(last_kcpu_type == BASE_KCPU_COMMAND_TYPE_FENCE_SIGNAL);
+   check(kcpu_enqueue_calls == 1);
+
+   /* The mock writes the descriptor back through base_fence, which is how the
+    * kernel hands it to userspace. A negative fd here would mean the driver
+    * never filled it in. */
+   check(fd == 99);
+
+   /* A failed enqueue must not report a descriptor. */
+   fail_kcpu_enqueue = true;
+   int bad_fd = -1;
+   check(kbase_csf_kcpu_fence_signal(kcpu, &bad_fd) == -1 && errno == EINVAL);
+   check(bad_fd == -1);
+   fail_kcpu_enqueue = false;
+
+   check(kbase_csf_kcpu_fence_signal(kcpu, NULL) == -1 && errno == EINVAL);
+   check(kbase_csf_kcpu_fence_signal(NULL, &fd) == -1 && errno == EINVAL);
+
+   /* The ioctl succeeded but the kernel never wrote a descriptor back. Reporting
+    * success here would hand callers a bogus descriptor, so it must be EPROTO. */
+   kcpu_fence_fd = -1;
+   int unreported = -1;
+   check(kbase_csf_kcpu_fence_signal(kcpu, &unreported) == -1 && errno == EPROTO);
+   check(unreported == -1);
+   kcpu_fence_fd = 99;
+
+   kbase_csf_kcpu_destroy(kcpu);
+   finish_context(ctx, dev);
+}
+
+static void
+test_kcpu_cqs_wait(void)
+{
+   reset_fake();
+   struct pan_kmod_dev *dev = NULL;
+   struct kbase_csf_context *ctx = create_context(&dev);
+   check(ctx);
+   struct kbase_csf_kcpu *kcpu = kbase_csf_kcpu_create(ctx);
+   check(kcpu);
+
+   /* Address and threshold must reach the kernel unchanged: the kernel compares
+    * *(uint32_t *)addr > val, so a swapped or truncated value silently waits on
+    * the wrong condition. */
+   check(kbase_csf_kcpu_cqs_wait(kcpu, 0x12345000ull, 7) == 0);
+   check(last_kcpu_type == BASE_KCPU_COMMAND_TYPE_CQS_WAIT);
+   check(last_cqs_addr == 0x12345000ull);
+   check(last_cqs_val == 7);
+
+   check(kbase_csf_kcpu_cqs_wait(NULL, 0x12345000ull, 7) == -1 && errno == EINVAL);
+
+   kbase_csf_kcpu_destroy(kcpu);
+   finish_context(ctx, dev);
+}
+
+static void
+test_kcpu_create_failure(void)
+{
+   reset_fake();
+   struct pan_kmod_dev *dev = NULL;
+   struct kbase_csf_context *ctx = create_context(&dev);
+   check(ctx);
+
+   fail_kcpu_create = true;
+   check(kbase_csf_kcpu_create(ctx) == NULL && errno == ENOMEM);
+   fail_kcpu_create = false;
+
+   check(kbase_csf_kcpu_create(NULL) == NULL && errno == EINVAL);
+
+   finish_context(ctx, dev);
+}
+
 int main(void)
 {
    test_sync_failure_and_wrap_padding();
@@ -659,5 +807,9 @@ int main(void)
    test_atomic_submit_cache_and_kick_failures();
    test_atomic_submit_stale_target();
    test_seqno_error_and_retained_lifetime();
+   test_kcpu_create_failure();
+   test_kcpu_create_delete();
+   test_kcpu_fence_signal();
+   test_kcpu_cqs_wait();
    return 0;
 }

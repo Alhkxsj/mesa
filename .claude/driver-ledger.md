@@ -123,3 +123,9 @@
 | 日期 | 原条目 | 更正为 | 依据 |
 |---|---|---|---|
 | _(暂无)_ | | | |
+
+| 2026-10-18 | ⭐ **`CQS_WAIT` / `FENCE_WAIT` 不阻塞内核线程**：`kbase_csf_kcpu_queue_process()` 是遍历 pending 命令的 for 循环，条件不满足时 `process_next = false` 后 `break` 出 switch，循环判 `process_next` 即返回 | **更正旧结论**"不可恢复地挂死内核 kcpu worker"。真实危害是该队列后续命令不推进 → 上层等不到 fence；`kill` 进程即触发 `kcpu_queue_context_term()` → `delete_queue(drain=true)` 清理 | `csf/mali_kbase_csf_kcpu.c:2593-2623`(FENCE_WAIT)、`:2645-2659`(CQS_WAIT)、`:3169-3178`(context_term) | 已验证（源码） |
+| 2026-10-18 | **`CQS_WAIT` 的对象必须有 `reg->cpu_alloc->permanent_map`**：`kbase_phy_alloc_mapping_get()` 在 `permanent_map == NULL` 时返回 NULL | 而该映射只对 `KBASE_MEM_TYPE_NATIVE` 且带 `BASE_MEM_PERMANENT_KERNEL_MAPPING` 的区域建立；`BASE_MEM_CSF_EVENT` 会自动带上它 ⇒ **只有 CSF_EVENT BO 能当 CQS 对象，imported dma-buf 不行** | `mali_kbase_mem_linux.c:202-232`(init)、`:246-288`(get)；`mali_kbase_mem.c:1248-1251` | 已验证（源码） |
+| 2026-10-18 | **内核在 `MEM_ALLOC_EX` 入口对 `CSF_EVENT` 强制补 flag**：`flags |= (BASE_MEM_SAME_VA \| BASE_MEM_CACHED_CPU \| BASE_MEM_COHERENT_SYSTEM)`，且拒绝 `gpu_executable`/`fixed_or_fixable` | ⇒ 客户端**不需要**自己加 `COHERENT_SYSTEM`；`KBASE_REG_SHARE_BOTH` 由内核置上，`WARN_ON(!SHARE_BOTH)` 不会触发 | `mali_kbase_core_linux.c:983-990`；Mesa 走 EX 见 `kbase_kmod.c:356-367` | 已验证（源码） |
+| 2026-10-18 | **KCPU 入队是单一命令**：`if (enq->nr_commands != 1) return -EINVAL;`（Base 接口不暴露多命令） | 多命令顺序只能靠**多次入队 + 队列 FIFO**（`queue->commands[(u8)(start_offset + i)]`）。所以"先 CQS_WAIT 后 FENCE_SIGNAL"要分两次 ioctl | `csf/mali_kbase_csf_kcpu.c:2997`、`:3040-3046` | 已验证（源码） |
+| 2026-10-18 | **`FENCE_SIGNAL` 在 prepare 阶段就建好 fd**：`dma_fence_init` + `sync_file_create` + `get_unused_fd_flags`，fd 写回用户态的 `base_fence.basep.fd`；命令**执行时**才 `dma_fence_signal()` | ⇒ 用户态在入队那一刻拿到 fd，它在此后的 CQS_WAIT 满足前一直未 signaled。**这正是"分两次入队"可行且正确的关键** | `csf/mali_kbase_csf_kcpu.c:1994-2042`(init)、`:2058-2085`(prepare)、`:1954`(signal 执行) | 已验证（源码） |
