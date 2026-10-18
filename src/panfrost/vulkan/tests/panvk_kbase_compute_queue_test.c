@@ -443,6 +443,23 @@ main(void)
    struct vk_sync_signal signal = {.sync = expected_signal};
    submit.signal_count = 1;
    submit.signals = &signal;
+   /* The first-frame report must describe the fixture as it actually is, and
+    * must not invent readiness.  It is read-only scaffolding: calling it does
+    * not submit, encode or allocate.
+    */
+   {
+      unsigned transport_before = transport_calls;
+      struct kbase_first_frame_report report =
+         kbase_first_frame_probe(&queue, &submit);
+      assert(transport_calls == transport_before);
+      assert(report.graphics_ready == queue.kbase.graphics_ready);
+      assert(report.has_tiler_heap == (queue.kbase.heap != NULL));
+      assert(report.desc_alias_present == (queue.kbase.desc_alias != NULL));
+      assert(report.tiler_heap_context == queue.tiler_heap.context.dev_addr);
+      assert(report.has_graphics_chunk);
+      assert(report.graphics_subqueues ==
+             ((1u << 0) | (1u << 1)));
+   }
    assert(kbase_compute_submit(&queue, &submit) == VK_SUCCESS);
    assert(vk_sync_wait(NULL, expected_signal, 0, VK_SYNC_WAIT_COMPLETE, 0) ==
           VK_SUCCESS);

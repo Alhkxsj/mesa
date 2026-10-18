@@ -319,10 +319,66 @@ kbase_compute_init(struct panvk_gpu_queue *queue)
    return kbase_compute_execute(queue, init_entries, PANVK_SUBQUEUE_COUNT);
 }
 
+/* First-frame readiness report.
+ *
+ * Static scaffolding only: it describes what a graphics submission would do
+ * and refuses nothing.  It exists so the first-frame experiment has a single
+ * place to assert its preconditions, and so the assumptions written down in
+ * first-frame-prep-20261018/EXPERIMENT-CARD.md have a counterpart in code.
+ *
+ * Deliberately does not submit, encode, or touch the heap.  Enabling it
+ * changes no behaviour beyond a debug line.
+ */
+struct kbase_first_frame_report {
+   bool graphics_ready;
+   bool has_graphics_chunk;
+   bool has_tiler_heap;
+   bool desc_alias_present;
+   unsigned graphics_subqueues;
+   uint64_t tiler_heap_context;
+};
+
+static struct kbase_first_frame_report
+kbase_first_frame_probe(struct panvk_gpu_queue *queue,
+                        const struct vk_queue_submit *submit)
+{
+   struct kbase_first_frame_report report = {
+      .graphics_ready = queue->kbase.graphics_ready,
+      .has_tiler_heap = queue->kbase.heap != NULL,
+      .desc_alias_present = queue->kbase.desc_alias != NULL,
+      .tiler_heap_context = queue->tiler_heap.context.dev_addr,
+   };
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      struct panvk_cmd_buffer *cmdbuf =
+         container_of(submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+      for (unsigned j = 0; j < PANVK_SUBQUEUE_COUNT; j++) {
+         struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
+         if (!cs_root_chunk_size(b))
+            continue;
+         if (j != PANVK_SUBQUEUE_COMPUTE) {
+            report.has_graphics_chunk = true;
+            report.graphics_subqueues |= 1u << j;
+         }
+      }
+   }
+   return report;
+}
+
 static VkResult
 kbase_compute_submit(struct panvk_gpu_queue *queue, struct vk_queue_submit *submit)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   if (PANVK_DEBUG(FIRST_FRAME)) {
+      struct kbase_first_frame_report r = kbase_first_frame_probe(queue, submit);
+      fprintf(stderr,
+              "KBASE_FIRST_FRAME graphics_ready=%u graphics_chunk=%u "
+              "graphics_subqueues=0x%x tiler_heap=%u heap_ctx=0x%llx "
+              "desc_alias=%u\n",
+              r.graphics_ready, r.has_graphics_chunk, r.graphics_subqueues,
+              r.has_tiler_heap, (unsigned long long)r.tiler_heap_context,
+              r.desc_alias_present);
+      fflush(stderr);
+   }
    if (vk_queue_submit_has_bind(submit) || PANVK_DEBUG(TRACE))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    for (uint32_t i = 0; i < submit->wait_count; i++) {
