@@ -1,3 +1,14 @@
+/*
+ * DEAD CODE - no production callers.
+ *
+ * Provides the completion half of the unused panvk_kbase_csf_submit() wrapper:
+ * a snapshot of queue/target pairs plus the vk_sync completion plumbing. Only
+ * panvk_kbase_csf_submit_test and panvk_kbase_sync_test exercise it.
+ *
+ * Production waits through kbase_csf_wait() in csf/panvk_kbase_compute_queue.inc.
+ * Kept, not deleted, because this is the structure an asynchronous submission
+ * would build on; see the header comment in panvk_kbase_csf_submit.c.
+ */
 #include "panvk_kbase_csf_sync.h"
 #include "panvk_kbase_sync.h"
 

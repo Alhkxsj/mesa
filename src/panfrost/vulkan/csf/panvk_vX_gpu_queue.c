@@ -350,6 +350,13 @@ init_utrace(struct panvk_gpu_queue *queue)
    VkResult result;
 
    const struct vk_sync_type *sync_type = phys_dev->sync_types[0];
+   /* utrace needs a DRM timeline syncobj to hand out a timeline fd.  The kbase
+    * backend's sync type is a userspace completion, so it satisfies neither
+    * condition -- but kbase never reaches this function: create_gpu_queue()
+    * takes the kbase branch and returns after kbase_compute_init().
+    * If that ordering ever changes, this assert fires first, which is the
+    * intent: utrace on kbase needs a real design, not a relaxed assert.
+    */
    assert(sync_type && vk_sync_type_is_drm_syncobj(sync_type) &&
           (sync_type->features & VK_SYNC_FEATURE_TIMELINE));
 

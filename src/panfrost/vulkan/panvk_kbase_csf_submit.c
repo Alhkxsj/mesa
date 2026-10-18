@@ -1,3 +1,23 @@
+/*
+ * DEAD CODE - no production callers.
+ *
+ * This module wraps "encode into a private buffer, submit, resolve completion"
+ * into one call, and it is exercised only by panvk_kbase_csf_submit_test.
+ * Production submission goes through kbase_compute_encode() and
+ * kbase_compute_execute() in csf/panvk_kbase_compute_queue.inc, which inline
+ * the same steps against the command buffer's own chunk storage.
+ *
+ * Keep it rather than delete it, because it records the vendor-shaped
+ * encode/submit/complete split and the completion plumbing
+ * (panvk_kbase_completion_* in panvk_kbase_sync.c, panvk_kbase_csf_sync.c)
+ * that a future asynchronous submission would need. Deleting it would lose
+ * that shape without gaining anything - it is not built into any hot path and
+ * costs nothing at runtime.
+ *
+ * Do NOT wire it up merely to make it live. Adding a second submission path
+ * means a second set of pass criteria and a second rollback oracle, which is
+ * exactly the situation the M5b-1 stage deliberately avoided.
+ */
 #include "panvk_kbase_csf_submit.h"
 #include "panvk_kbase_csf_sync.h"
 #include "panvk_kbase_sync.h"

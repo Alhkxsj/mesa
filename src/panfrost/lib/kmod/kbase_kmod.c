@@ -580,6 +580,15 @@ kbase_kmod_bo_munmap(struct pan_kmod_bo *base, void *host_addr, size_t size)
    return 0;
 }
 
+/* kbase has no per-BO completion object. Waiting on a BO in the DRM backends
+ * means "is this buffer's GPU access finished", which they answer with a
+ * reservation object. kbase tracks completion per CSF queue as a seqno cell
+ * and has nothing BO-scoped to query, so this cannot be implemented without
+ * inventing a mapping from BOs to whatever job happened to touch them.
+ *
+ * Unreachable today: the only caller is panfrost_bo_wait() in Gallium, and
+ * panfrost_open_device() refuses kbase outright.
+ */
 static bool
 kbase_kmod_bo_wait(UNUSED struct pan_kmod_bo *bo, UNUSED int64_t timeout_ns,
                     UNUSED bool for_read_only_access)
