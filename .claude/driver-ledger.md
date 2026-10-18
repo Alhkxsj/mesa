@@ -107,6 +107,12 @@
 | 2026-10-18 | **单元测试断言要挑 fixture 真有值的字段**：`desc_alias` 与 `tiler_heap.context` 在 `panvk_kbase_compute_queue_test.c` 的那个位置分别是 NULL / 0，拿它们做断言恒真、**oracle 不挂**。改用 `has_tiler_heap`（该点已建 heap）后 oracle 立即成立 | "断言 == 常量" 与 "断言 == 未初始化的镜像" 同样无效 | 三次 oracle 尝试：`graphics_ready`(恒 true)、`desc_alias`(两边 false)、`tiler_heap_context`(两边 0) 都没挂；`has_tiler_heap` 挂 | 已验证 |
 | 2026-10-18 | **meson 不把 `.inc` 当依赖**：改 `panvk_kbase_compute_queue.inc` 后 `ninja` 报 `no work to do`，测试仍是旧二进制 | `.inc` 被 `#include` 但不进依赖图 | 观察：改 `.inc` 后 ninja 无动作；`rm` 掉 `.o` 才重编 | 已验证（**改 `.inc` 后要 `rm` 对应 `.o` 或 `touch` 测试源**） |
 
+| 2026-10-18 | ⭐ **U1 源码裁决：kbase 的 started-only heap 统计是安全的**。校验在 `mali_kbase_csf.c:2076`：`(frag_end > vt_end) \|\| (vt_end >= vt_start)` → 杀组。started-only 的 `vt_start=N, vt_end=0, frag_end=0` 代入**两条都不成立**；第二层 `validate_allocation_request()` 的 `WARN_ON(!nr_in_flight)`（`nr_in_flight = N`）也不触发 | 而且这段只在固件发 `CS_REQ.TILER_OOM` 时跑，kbase 跳过 `cs_set_exception_handler(TILER_OOM)` ⇒ **校验根本不会执行** | `mt6991-kernel-src/.../csf/mali_kbase_csf.c:2062-2100`、`:2200-2226`；`csf/mali_kbase_csf_tiler_heap.c` `validate_allocation_request` | 已验证（官方 GPL 源码） |
+| 2026-10-18 | **`get_aliased_alloc` 是循环遍历，不是"只看首段"**：`while (*start_off >= stride) { aliased++; *start_off -= stride; }`。所以 offset==stride **能正确选到 entry[1]** | "alias CPU 映射只覆盖首段"是 **CPU fault 路径**的特有问题（调用处总传 VMA 起点），**GPU 路径不受影响** | `mt6991-kernel-src/.../mali_kbase_mem_linux.c:2530` | 已验证（源码） |
+| 2026-10-18 | **imported UMM 在 import 时就建好 GPU 页表**：`kbase_mem_umm_map_attachment()` 立即 `dma_buf_map_attachment(DMA_BIDIRECTIONAL)` 并把 `sg_dma_address` 填进 `gpu_alloc`、设 `nents` | 前提是 `CONFIG_MALI_DMA_BUF_MAP_ON_DEMAND` 未开（源里 `if (!IS_ENABLED(...))` 分支）。**未验的只剩缓存一致性**（源码注释明说无法查询 exporter 的 CPU 缓存属性） | `mt6991-kernel-src/.../mali_kbase_mem_linux.c` 的 `kbase_mem_umm_map_attachment` | 已验证（源码） |
+| 2026-10-18 | **KCPU 的 FENCE_SIGNAL 产出真 `dma_fence`**：`csf/mali_kbase_csf_kcpu.c:2025` `*sync_file = sync_file_create(fence_out);` ⇒ 内核侧有 timeline 语义的 fence，**是我们用户态没接**，不是内核做不到 | 影响 U7（timeline semaphore）的定性：属"没做"而非"做不了" | 同左 | 已验证（源码） |
+| 2026-10-18 | **dma-heap 的 `fd_flags` 带 `O_RDWR` 时拒绝非页对齐长度（EINVAL）**，`O_RDONLY` 则接受。非页对齐 dma-buf（1/4095/4097/8191/12289）import 全部成功，`va_pages` 正确向上取整 | 探针改用 `O_RDONLY \| O_CLOEXEC` | 真机 `import-probe/live-import-unaligned.log`；`strace` 对照 | 已验证（真机） |
+
 > M5a / M5b-1 真机实测硬件事实（设备身份、ioctl 观测、映射生命周期、用户提交的 kick）见
 > `/home/zl/github/mesa-port-backups/RE-NOTES.md` §8 与 §10；本台账不重复抄录。
 
