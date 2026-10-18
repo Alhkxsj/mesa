@@ -1,3 +1,5 @@
+#include <stdlib.h>
+
 #include "panvk_kbase_device.h"
 #include "panvk_instance.h"
 #include "panvk_physical_device.h"
@@ -92,12 +94,21 @@ panvk_kbase_physical_device_capabilities(struct vk_device_extension_table *exten
       *extensions = (struct vk_device_extension_table){0};
    if (features) {
       *features = (struct vk_features){
-         /* Verified on hardware: an isotropic sampler averages a one-texel
-          * stripe texture to flat grey while the anisotropic sampler keeps
-          * the full range, so the difference is the filtering and not a
-          * missing sample. See s10-aniso-20261018.
-          */
+         /* Each of these was checked against hardware behaviour, not read off
+          * the vendor source. See the probe archives under
+          * mesa-port-backups/ for the exact evidence behind each one. */
+         /* s10: an isotropic sampler averages a one-texel stripe texture to
+          * flat grey while the anisotropic sampler keeps the full range. */
          .samplerAnisotropy = true,
+         /* s11: a quad entirely beyond the far plane draws nothing with
+          * depthClamp off and covers the viewport with it on. */
+         .depthClamp = true,
+         /* s12: the same bias moves the sampled depth to 0.488 unclamped and
+          * stops at 0.300 when clamped. */
+         .depthBiasClamp = true,
+         /* s13: additive and replace states on two attachments give
+          * 255,64,64 and 255,0,0 respectively. */
+         .independentBlend = true,
       };
    }
 }

@@ -204,6 +204,9 @@ test_policy(void)
     * else must stay off. */
    const struct vk_features kbase_features = {
       .samplerAnisotropy = true,
+      .depthClamp = true,
+      .depthBiasClamp = true,
+      .independentBlend = true,
    };
    assert(!memcmp(&features, &kbase_features, sizeof(features)));
    struct vk_properties props = {.apiVersion = VK_API_VERSION_1_4,
