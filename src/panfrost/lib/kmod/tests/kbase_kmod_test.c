@@ -986,6 +986,39 @@ test_cache_sync(void)
    check(munmap_calls == 1);
    pan_kmod_dev_destroy(dev);
    check(munmap_calls == 2 && unexpected_calls == 0);
+
+   /* An imported dma-buf BO is NO_MMAP because the kernel rejects CPU faults
+    * on it, but it still owns a mapping the exporter can maintain. It must be
+    * syncable so a caller can invalidate before reading GPU-written data.
+    */
+   reset_fake();
+   dev = create_device(0);
+   check(dev != NULL);
+   struct pan_kmod_bo *imported = pan_kmod_bo_import(dev, IMPORT_FD);
+   check(imported != NULL);
+   check(imported->flags & PAN_KMOD_BO_FLAG_IMPORTED);
+   check(imported->flags & PAN_KMOD_BO_FLAG_NO_MMAP);
+   unsigned before = mem_sync_calls;
+   check(kbase_kmod_bo_sync(imported, 0, PAGE_SIZE,
+                            PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE) == 0);
+   check(mem_sync_calls == before + 1);
+   pan_kmod_bo_put(imported);
+   pan_kmod_dev_destroy(dev);
+
+   /* A NO_MMAP BO that was not imported has no mapping at all and must still
+    * be refused.
+    */
+   reset_fake();
+   dev = create_device(0);
+   check(dev != NULL);
+   struct pan_kmod_bo *no_mmap =
+      pan_kmod_bo_alloc(dev, NULL, PAGE_SIZE, PAN_KMOD_BO_FLAG_NO_MMAP);
+   check(no_mmap != NULL);
+   check(kbase_kmod_bo_sync(no_mmap, 0, PAGE_SIZE,
+                            PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH) == -1 &&
+         errno == EINVAL);
+   pan_kmod_bo_put(no_mmap);
+   pan_kmod_dev_destroy(dev);
 }
 
 static void

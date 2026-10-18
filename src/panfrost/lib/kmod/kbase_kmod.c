@@ -661,19 +661,38 @@ kbase_kmod_bo_gpu_va(struct pan_kmod_bo *bo)
    return container_of(bo, struct kbase_kmod_bo, base)->gpu_va;
 }
 
+/* Cache maintenance on a BO.
+ *
+ * NO_MMAP normally means "no CPU mapping to touch", so syncing is pointless.
+ * Imported dma-buf BOs are the exception: they are NO_MMAP because the kernel
+ * refuses CPU faults on them, yet they still own a CPU mapping that the
+ * exporter can maintain.  The kernel's MEM_SYNC takes the user address and
+ * calls dma_buf_begin_cpu_access()/end_cpu_access() with it; it never
+ * dereferences it.  Treat the imported case as syncable so callers can
+ * invalidate the CPU cache before reading data the GPU wrote.
+ */
 int
 kbase_kmod_bo_sync(struct pan_kmod_bo *bo, uint64_t offset, uint64_t size,
                     enum pan_kmod_bo_sync_type type)
 {
    if (!bo || bo->dev->ops != &kbase_kmod_ops || !size ||
        offset > bo->size || size > bo->size - offset ||
-       (bo->flags & PAN_KMOD_BO_FLAG_NO_MMAP) ||
-       (type != PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH &&
-        type != PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE)) {
+       type != PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH &&
+       type != PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE) {
       errno = EINVAL;
       return -1;
    }
    struct kbase_kmod_bo *kbo = container_of(bo, struct kbase_kmod_bo, base);
+   /* A NO_MMAP BO that is not imported has no mapping at all. */
+   if ((bo->flags & PAN_KMOD_BO_FLAG_NO_MMAP) &&
+       !(bo->flags & PAN_KMOD_BO_FLAG_IMPORTED)) {
+      errno = EINVAL;
+      return -1;
+   }
+   if (!kbo->cpu_ptr) {
+      errno = EINVAL;
+      return -1;
+   }
    struct kbase_ioctl_mem_sync req = {
       .handle = kbo->gpu_va,
       .user_addr = (uintptr_t)kbo->cpu_ptr + offset,
