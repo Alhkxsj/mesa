@@ -56,6 +56,7 @@ static const struct debug_control panvk_debug_options[] = {
    {"no_crc", PANVK_DEBUG_NO_CRC},
    {"alias_writeback", PANVK_DEBUG_ALIAS_WRITEBACK},
    {"first_frame", PANVK_DEBUG_FIRST_FRAME},
+   {"alias_geometry", PANVK_DEBUG_ALIAS_GEOMETRY},
    {NULL, 0},
 };
 

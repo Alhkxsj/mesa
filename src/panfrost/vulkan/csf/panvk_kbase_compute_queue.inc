@@ -44,6 +44,22 @@ kbase_compute_encode(struct panvk_gpu_queue *queue, uint32_t subqueue,
                            RENDER_DESC_RINGBUF_SIZE;
       info.probe_value = 0x1122334455667788ull;
    }
+   /* Geometry probe: same write, but aimed at the LAST alias entry, so the
+    * entry walk is exercised for counts other than the production 2.  The
+    * write lands at (entry_count-1)*stride into the repeated backing BO, which
+    * for count N is offset ((N-1)*stride) mod stride == 0 in the backing page,
+    * so the readback address stays the backing base.
+    */
+   if (PANVK_DEBUG(ALIAS_GEOMETRY) && queue->render_desc_ringbuf.addr.dev &&
+       subqueue == PANVK_SUBQUEUE_COMPUTE) {
+      const char *n = getenv("PANVK_KBASE_ALIAS_ENTRIES");
+      long entries = (n && *n) ? strtol(n, NULL, 0) : 2;
+      if (entries < 2 || entries > 4)
+         entries = 2;
+      info.probe_address = queue->render_desc_ringbuf.addr.dev +
+                           (uint64_t)(entries - 1) * RENDER_DESC_RINGBUF_SIZE;
+      info.probe_value = 0x1122334455667788ull;
+   }
    entry->subqueue = subqueue;
    return panvk_per_arch(kbase_csf_encode)(&info, entry->commands,
                                            sizeof(entry->commands), &entry->size);
@@ -85,7 +101,8 @@ kbase_compute_execute(struct panvk_gpu_queue *queue,
     * probe write, so the first observation legitimately reads zero.  Report
     * each one and let the last submission be the one that must match.
     */
-   if (PANVK_DEBUG(ALIAS_WRITEBACK) && queue->render_desc_ringbuf.addr.host) {
+   if ((PANVK_DEBUG(ALIAS_WRITEBACK) || PANVK_DEBUG(ALIAS_GEOMETRY)) &&
+       queue->render_desc_ringbuf.addr.host) {
       const uint64_t expected = 0x1122334455667788ull;
       const uint64_t observed =
          *(volatile uint64_t *)queue->render_desc_ringbuf.addr.host;
@@ -193,7 +210,21 @@ kbase_graphics_resources(struct panvk_gpu_queue *queue)
    ring->bo = pan_kmod_bo_alloc(dev->kmod.dev, dev->kmod.vm, ring->size, 0);
    if (!ring->bo)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   queue->kbase.desc_alias = kbase_kmod_alias_create(ring->bo, ring->size, 2);
+   /* Entry count is fixed at 2 in production (a double-buffered window).  The
+    * alias geometry probe overrides it to check that GPU resolution of the
+    * later entries holds for other counts; see PANVK_DEBUG=alias_geometry.
+    */
+   uint32_t alias_entries = 2;
+   if (PANVK_DEBUG(ALIAS_GEOMETRY)) {
+      const char *n = getenv("PANVK_KBASE_ALIAS_ENTRIES");
+      if (n && *n) {
+         long v = strtol(n, NULL, 0);
+         if (v >= 2 && v <= 4)
+            alias_entries = (uint32_t)v;
+      }
+   }
+   queue->kbase.desc_alias =
+      kbase_kmod_alias_create(ring->bo, ring->size, alias_entries);
    if (!queue->kbase.desc_alias)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    ring->addr.dev = kbase_kmod_alias_gpu_va(queue->kbase.desc_alias);
