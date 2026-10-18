@@ -97,6 +97,11 @@
 | 2026-10-18 | **kbase 路径从不设置 `render_desc_ringbuf.addr.host`**：`panvk_vX_gpu_queue.c:112` 只在 DRM 路径设它；`kbase_graphics_resources()` 自建 ring BO，不设。于是 `panvk_vX_gpu_queue.c:76` 的 teardown 分支在 kbase 上**永远不执行** | 两条路径各自建 ring，kbase 分支漏了对应字段 | `grep -n addr.host src/panfrost/vulkan/csf/panvk_kbase_compute_queue.inc`（只有注释命中，无赋值）；`panvk_vX_gpu_queue.c:76,112` | 已验证（静态）；**未修** |
 | 2026-10-18 | **探针环境下 mesa 日志整体不可用**：`PANVK_DEBUG=startup` 不打印 `panvk_debug:` 行，驱动内 `mesa_logi` 与裸 `fprintf(stderr)` 均无输出，而探针自己的 `printf` 正常。guard 是默认 `DENY` 白名单且不含 `write`，但 `printf` 能出说明不全是 guard 的锅 | 未定 | 多次 `--live-submit` 尝试 | **未解决**（阻塞基于日志的回读方案） |
 
+| 2026-10-18 | ⭐ **alias 环形窗口闭环证明**：GPU 写 `alias_va+512KiB` 的值被 CPU 从 backing 映射**精确读回**（`expected=0x1122334455667788 observed=0x1122334455667788 match=1`，两次）。⇒ 第二段解析到**预期的物理页**（= 唯一 backing BO 的起点），不只是"能寻址" | alias 的 `nents=2 × stride=512KiB` 确实是**同一块物理内存的两份视图**，GPU 侧按 1 MiB 环形窗口使用是成立的 | `a-20261018-085944/logs/a-live-alias-readback.log`；oracle：写地址 +8 ⇒ 全部 match=0、exit=1 | 已验证（真机，生产几何 512KiB×2） |
+| 2026-10-18 | **探针会主动 `unsetenv("PANVK_DEBUG")`**（`panvk_kbase_enum_probe.c:1370`），这是为了基线可复现的**故意设计**。任何经 `PANVK_DEBUG` 门控的驱动侧调试在探针里**永远看不到** | 探针固定环境后 `dlopen` ICD；`panvk_debug_init` 在 ICD 的 `CreateInstance` 里才跑，读到的是被清空后的 environ | 修复前 `KBASE_DBG_INIT PANVK_DEBUG=(null) panvk_debug=0x0`；改经 `PANVK_KBASE_PROBE_DEBUG` 转发后 `panvk_debug=0x100000` | 已验证（已修：探针转发 `PANVK_KBASE_PROBE_DEBUG`→`PANVK_DEBUG`，默认仍隔离） |
+| 2026-10-18 | **kbase teardown 安全**：`destroy_gpu_queue()` 走 `panvk_device_uses_kbase()` 分支调 `kbase_compute_cleanup()`，**不经过** `cleanup_queue()`/`finish_render_desc_ringbuf()` ⇒ 那个会在 kbase 上误调 `panvk_as_free(alias_va)` 的路径**根本不可达**（该 VA 从未经 `panvk_as_alloc`） | 两条 destroy 路径分离 | `panvk_vX_gpu_queue.c:1520-1537` 的早期 return；`kbase_compute_cleanup` 全文 | 已验证（静态 + 97/97 回归） |
+| 2026-10-18 | **`addr.host` 在 kbase 上是"借来的只读视图"**，不能参与释放：backing 映射归 `kbase_kmod_bo_free()`（`munmap(cpu_ptr)`），alias 映射归 `kbase_kmod_alias_destroy()`（`munmap(mapping)`）。从 `addr.host` 再 munmap 会 **double-munmap** | 两处各自拥有自己的映射 | `kbase_kmod.c` 的 `bo_free` / `alias_destroy`；`kbase_compute_cleanup` 里显式清空 `addr.host` | 已验证（已按此实现） |
+
 > M5a / M5b-1 真机实测硬件事实（设备身份、ioctl 观测、映射生命周期、用户提交的 kick）见
 > `/home/zl/github/mesa-port-backups/RE-NOTES.md` §8 与 §10；本台账不重复抄录。
 
