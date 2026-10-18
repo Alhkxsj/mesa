@@ -93,6 +93,10 @@
 |---|---|---|---|
 | 2026-10-18 | 2026-10-18「更正上一条 `PROT_NONE` 的理由」条目称：**"内核确实强制加了 `CPU_RD`（`0x500c` 含 bit0），所以 `PROT_READ` 映射能过一致性检查"** | **该更正本身是错的。** `0x500c` 的 bit0 = **0**，`CPU_RD` 与 `CPU_WR` **都没给**。因此 **`PROT_NONE` 确实是唯一能过 `kbase_context_mmap` 一致性检查的形状**（`CPU_RD \|\| !VM_READ` 与 `CPU_WR \|\| !VM_WRITE` 只有 VM_READ/VM_WRITE 都为假时才恒真）。原始 static 推断（`ab-20261018` rev2 的 "hard_constraint_2"）是对的，是这次真机解读算错了位。 | `grep 'BASE_MEM_CACHED_CPU' include/drm-uapi/mali_kbase_ioctl.h` → `1 << 12`；`0x500c & 1 == 0`；真机日志 `cpu_rd=0 cpu_wr=0 cached=1`；探针打印用的是正确的 uapi 宏，错的是台账解读 |
 
+| 2026-10-18 | **alias 第二段对 GPU 可达**：带 `SYNC_ADD64 @ alias_va+512KiB` 的 compute 流真机提交返回 `VK_SUCCESS` 且 `vkQueueWaitIdle` 返回 `VK_SUCCESS`（`accepted=1 blocked=0 gpu_completion_observed=1`）。因 `kbase_compute_execute` 把任何提交/完成失败都映射成 `vk_queue_set_lost`，这说明**第二段在 GPU 页表里是映射的**——未映射会 fault 并置 lost | GPU 页表覆盖 `stride*nents`，不只是首段。**注意：这只证明"可寻址"，未证明"写入的数据正确"**（没有回读） | `c-20261018-084340/logs/live-alias-writeback.log`；3 次运行全 exit=0，无 panic/黑屏 | 已验证（真机，可达性）；**数据正确性未证明** |
+| 2026-10-18 | **kbase 路径从不设置 `render_desc_ringbuf.addr.host`**：`panvk_vX_gpu_queue.c:112` 只在 DRM 路径设它；`kbase_graphics_resources()` 自建 ring BO，不设。于是 `panvk_vX_gpu_queue.c:76` 的 teardown 分支在 kbase 上**永远不执行** | 两条路径各自建 ring，kbase 分支漏了对应字段 | `grep -n addr.host src/panfrost/vulkan/csf/panvk_kbase_compute_queue.inc`（只有注释命中，无赋值）；`panvk_vX_gpu_queue.c:76,112` | 已验证（静态）；**未修** |
+| 2026-10-18 | **探针环境下 mesa 日志整体不可用**：`PANVK_DEBUG=startup` 不打印 `panvk_debug:` 行，驱动内 `mesa_logi` 与裸 `fprintf(stderr)` 均无输出，而探针自己的 `printf` 正常。guard 是默认 `DENY` 白名单且不含 `write`，但 `printf` 能出说明不全是 guard 的锅 | 未定 | 多次 `--live-submit` 尝试 | **未解决**（阻塞基于日志的回读方案） |
+
 > M5a / M5b-1 真机实测硬件事实（设备身份、ioctl 观测、映射生命周期、用户提交的 kick）见
 > `/home/zl/github/mesa-port-backups/RE-NOTES.md` §8 与 §10；本台账不重复抄录。
 
