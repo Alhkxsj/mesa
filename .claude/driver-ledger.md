@@ -83,7 +83,15 @@
 
 | 2026-10-18 | **真机 `MEM_IMPORT` 实测（首次）**：4 KiB dma-buf（`/dev/dma_heap/system`）导入成功，**返回 cookie `0x41000`**（cookie 窗口内），`va_pages=1`，`flags=0x500c`，`same_va=0`、`need_mmap=1`。`mmap(PROT_NONE, 4096, MAP_SHARED, fd, 0x41000)` 成功，`munmap` ret=0。连跑 4 次结果**逐字节一致**，dmesg 零错误 | 静态预测的五条全部命中；`0x500c` = `NEED_MMAP(0x4000)｜CACHED_CPU(0x1000)｜CPU_RD(0x1)｜GPU_RD(0x4)｜GPU_WR(0x8)` | `import-probe/live-import.log`，探针源码 `import-probe/kbase_import_probe.c` | 已验证（真机，PLC110，kbase 1.30） |
 | 2026-10-18 | **更正上一条 `PROT_NONE` 的理由**：内核**确实**强制加了 `CPU_RD`（`0x500c` 含 bit0），所以 `PROT_READ` 映射**能过**一致性检查；挡住的只是 `PROT_WRITE`（`CPU_WR` 未给）。`PROT_NONE` 仍是最稳妥选择，但**不是唯一能通过的形状** —— 原记录说"唯一"是错的 | 实测 `flags=0x500c`；`kbase_mem_from_umm` 强制 `CACHED_CPU` + `kbase_update_region_flags` 把 `PROT_CPU_RD` 映成 reg `CPU_RD` | 同上 live-import.log | 已验证（更正 static-only 推断） |
-| 2026-10-18 | **`MEM_IMPORT` 的错误码反直觉**：非法 `type`（`0xdead`）返回 **`ENOMEM(12)`**，不是 `EINVAL` | 内核 `kbase_mem_import` 的 `default:` 分支 `reg = NULL; goto no_reg`，`no_reg` 统一 `return -ENOMEM` | live-import.log 的 `CONTROL bad_type ret=-1 errno=12`；与反编译的 `LAB_0014fd00: uVar15 = 0xfffffff4`（-12）一致 | 已验证（真机 + 静态吻合） |
+| 2026-10-18 | **`MEM_IMPORT` 错误码反直觉**：非法 `type`（`0xdead`）返回 **`ENOMEM(12)`**，不是 `EINVAL` | 内核 `kbase_mem_import` 的 `default:` 分支 `reg = NULL; goto no_reg`，`no_reg` 统一 `return -ENOMEM` | live-import.log 的 `CONTROL bad_type ret=-1 errno=12`；与反编译的 `LAB_0014fd00: uVar15 = 0xfffffff4`（-12）一致 | 已验证（真机 + 静态吻合） |
+| 2026-10-18 | **多尺寸 `MEM_IMPORT` 扫描 8/8 全过**：4 KiB / 8 KiB / 16 KiB / 64 KiB / 256 KiB / 1 MiB / 2 MiB / 8 MiB，每个都返回**同一个 cookie `0x41000`**（cookie 归还后复用，与 M4g 的槽位复用语义一致），`va_pages` 随尺寸 1→2048 线性增长，`PROT_NONE` placement mmap 与 `munmap` 全部成功 | 每次 import 单独分配/释放，失败可归因到尺寸 | `import-probe/live-import-sizes.log` | 已验证（真机） |
+| 2026-10-18 | **`0x500c` 的正确解码**：`NEED_MMAP(bit14) \| CACHED_CPU(bit12) \| GPU_RD(bit2) \| GPU_WR(bit3)`。**`CPU_RD(bit0)` 与 `CPU_WR(bit1) 都是 0`** —— 内核**没有**给 CPU 权限 | `kbase_mem_from_umm` 只强制 `CACHED_CPU`；`kbase_update_region_flags` 不会凭空加 CPU 位 | 真机 `flags=0x500c`；uapi `BASE_MEM_CACHED_CPU = 1<<12`、`CPU_RD = 1<<0` | 已验证（真机 + uapi 对照） |
+
+## 更正记录
+
+| 日期 | 原条目 | 更正为 | 依据 |
+|---|---|---|---|
+| 2026-10-18 | 2026-10-18「更正上一条 `PROT_NONE` 的理由」条目称：**"内核确实强制加了 `CPU_RD`（`0x500c` 含 bit0），所以 `PROT_READ` 映射能过一致性检查"** | **该更正本身是错的。** `0x500c` 的 bit0 = **0**，`CPU_RD` 与 `CPU_WR` **都没给**。因此 **`PROT_NONE` 确实是唯一能过 `kbase_context_mmap` 一致性检查的形状**（`CPU_RD \|\| !VM_READ` 与 `CPU_WR \|\| !VM_WRITE` 只有 VM_READ/VM_WRITE 都为假时才恒真）。原始 static 推断（`ab-20261018` rev2 的 "hard_constraint_2"）是对的，是这次真机解读算错了位。 | `grep 'BASE_MEM_CACHED_CPU' include/drm-uapi/mali_kbase_ioctl.h` → `1 << 12`；`0x500c & 1 == 0`；真机日志 `cpu_rd=0 cpu_wr=0 cached=1`；探针打印用的是正确的 uapi 宏，错的是台账解读 |
 
 > M5a / M5b-1 真机实测硬件事实（设备身份、ioctl 观测、映射生命周期、用户提交的 kick）见
 > `/home/zl/github/mesa-port-backups/RE-NOTES.md` §8 与 §10；本台账不重复抄录。
