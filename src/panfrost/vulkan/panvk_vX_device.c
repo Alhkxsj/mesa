@@ -23,6 +23,8 @@
 #include "panvk_buffer.h"
 #include "panvk_cmd_alloc.h"
 #include "panvk_cmd_buffer.h"
+#include <stdlib.h>
+
 #include "panvk_device.h"
 #include "panvk_cmd_draw.h"
 #include "panvk_entrypoints.h"
@@ -512,7 +514,10 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       &dispatch_table, &panvk_per_arch(device_entrypoints), PAN_ARCH > 9);
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
                                              &panvk_device_entrypoints, false);
-   if (!panvk_physical_device_uses_kbase(physical_device))
+   /* Swapchain entry points are only registered when WSI is actually set up;
+    * for kbase that means the software presentation path. */
+   if (!panvk_physical_device_uses_kbase(physical_device) ||
+       getenv("PANVK_KBASE_WSI_SW") != NULL)
       vk_device_dispatch_table_from_entrypoints(&dispatch_table,
                                                 &wsi_device_entrypoints, false);
 #ifdef HAVE_PAN_KMOD_KBASE

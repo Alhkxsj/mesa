@@ -9,6 +9,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdlib.h>
+
 #include "panvk_wsi.h"
 #include "panvk_instance.h"
 #include "panvk_physical_device.h"
@@ -51,9 +53,23 @@ panvk_wsi_init(struct panvk_physical_device *physical_device)
                             panvk_physical_device_to_handle(physical_device),
                             panvk_wsi_proc_addr, &instance->vk.alloc, -1,
                             &instance->drirc.options,
-                            &(struct wsi_device_options){.sw_device = false});
+                            &(struct wsi_device_options){
+                               /* kbase has no dma-buf exporter, so the WSI
+                                * backend cannot hand images to the compositor
+                                * that way. The software path skips
+                                * GetMemoryFdKHR entirely and copies through
+                                * host memory instead. Opt-in until the path
+                                * has been exercised on hardware. */
+                               .sw_device = getenv("PANVK_KBASE_WSI_SW") != NULL,
+                            });
    if (result != VK_SUCCESS)
       return result;
+
+   /* kbase sync state lives in userspace seqnos and cannot be copied as DRM
+    * syncobj payloads. Keep even empty WSI submits on the real queue so
+    * present fences are backed by the kbase submission timeline. */
+   physical_device->wsi_device.disable_unordered_submits =
+      panvk_physical_device_uses_kbase(physical_device);
 
    physical_device->wsi_device.supports_modifiers = true;
    physical_device->wsi_device.can_present_on_device =

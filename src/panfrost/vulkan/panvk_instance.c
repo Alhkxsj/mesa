@@ -16,6 +16,9 @@
 #include "util/os_misc.h"
 #include "util/u_call_once.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "vk_alloc.h"
 #include "vk_log.h"
 
@@ -90,7 +93,37 @@ panvk_EnumerateInstanceVersion(uint32_t *pApiVersion)
 {
 #ifdef HAVE_PAN_KMOD_KBASE
    if (os_get_option("PANVK_KBASE_DEVICE")) {
-      *pApiVersion = VK_API_VERSION_1_0;
+      const char *experiment = getenv("PANVK_KBASE_EXPERIMENT");
+      bool rollback_1_0 = false;
+      bool rollback_1_1 = false;
+      bool api_1_2 = false;
+
+      /* Minimum 1.1 is the default for the kbase ICD; the loader must see the
+       * same instance version or it treats the ICD as 1.0.  apiVersion1.0 in
+       * the experiment switch is the explicit rollback path; apiVersion1.2
+       * is verification-only. */
+      for (const char *p = experiment; p && *p;) {
+         const char *end = strchr(p, ',');
+         const size_t len = end ? (size_t)(end - p) : strlen(p);
+         if (len == strlen("apiVersion1.0") &&
+             !strncmp(p, "apiVersion1.0", len)) {
+            rollback_1_0 = true;
+            break;
+         }
+         if (len == strlen("apiVersion1.1") &&
+             !strncmp(p, "apiVersion1.1", len))
+            rollback_1_1 = true;
+         if (len == strlen("apiVersion1.2") &&
+             !strncmp(p, "apiVersion1.2", len))
+            api_1_2 = true;
+         if (!end)
+            break;
+         p = end + 1;
+      }
+
+      *pApiVersion = rollback_1_0 ? VK_API_VERSION_1_0 :
+                     (rollback_1_1 ? VK_API_VERSION_1_1 :
+                      (api_1_2 ? VK_API_VERSION_1_2 : VK_API_VERSION_1_1));
       return VK_SUCCESS;
    }
 #endif
@@ -145,6 +178,26 @@ static const struct vk_instance_extension_table panvk_instance_extensions = {
 #ifdef HAVE_PAN_KMOD_KBASE
 static const struct vk_instance_extension_table panvk_kbase_instance_extensions = {
    .KHR_get_physical_device_properties2 = true,
+   .KHR_external_memory_capabilities = true,
+#ifdef PANVK_USE_WSI_PLATFORM
+   /* WSI needs these at the instance level. kbase cannot export dma-buf, so
+    * presentation only works through the software path; the extensions are
+    * still required for the surface object to exist at all. */
+   .KHR_surface = true,
+   .KHR_surface_maintenance1 = true,
+   .EXT_surface_maintenance1 = true,
+   .EXT_swapchain_colorspace = true,
+   .KHR_get_surface_capabilities2 = true,
+#endif
+#ifdef VK_USE_PLATFORM_XCB_KHR
+   .KHR_xcb_surface = true,
+#endif
+#ifdef VK_USE_PLATFORM_XLIB_KHR
+   .KHR_xlib_surface = true,
+#endif
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+   .KHR_wayland_surface = true,
+#endif
 };
 #endif
 

@@ -31,6 +31,8 @@
 #include "panvk_entrypoints.h"
 #include "panvk_image.h"
 #include "panvk_instance.h"
+#include <stdlib.h>
+
 #include "panvk_physical_device.h"
 #include "panvk_wsi.h"
 
@@ -487,7 +489,10 @@ physical_device_init(struct panvk_physical_device *device,
    struct vk_physical_device_dispatch_table dispatch_table;
    vk_physical_device_dispatch_table_from_entrypoints(
       &dispatch_table, &panvk_physical_device_entrypoints, true);
-   if (!panvk_physical_device_uses_kbase(device))
+   /* The physical-device WSI entry points are needed whenever a surface can
+    * exist at all, which for kbase means the software presentation path. */
+   if (!panvk_physical_device_uses_kbase(device) ||
+       getenv("PANVK_KBASE_WSI_SW") != NULL)
       vk_physical_device_dispatch_table_from_entrypoints(
          &dispatch_table, &wsi_physical_device_entrypoints, false);
 
@@ -507,7 +512,11 @@ physical_device_init(struct panvk_physical_device *device,
 
    device->vk.supported_sync_types = device->sync_types;
 
-   if (!panvk_physical_device_uses_kbase(device)) {
+   /* WSI is normally skipped for kbase because it has no dma-buf exporter.
+    * With the software presentation path enabled it can still work, so allow
+    * opting in while the path is being verified. */
+   if (!panvk_physical_device_uses_kbase(device) ||
+       getenv("PANVK_KBASE_WSI_SW") != NULL) {
       result = panvk_wsi_init(device);
       if (result != VK_SUCCESS)
          goto fail;
@@ -1889,7 +1898,24 @@ panvk_GetPhysicalDeviceExternalBufferProperties(
 {
    VK_FROM_HANDLE(panvk_physical_device, physical_device, physicalDevice);
    if (panvk_physical_device_uses_kbase(physical_device)) {
-      pExternalBufferProperties->externalMemoryProperties = (VkExternalMemoryProperties){0};
+      const VkExternalMemoryHandleTypeFlags supported_handle_types =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+      if (pExternalBufferInfo->handleType & supported_handle_types) {
+         /* kbase_kmod_bo_import() can import these; kbase_kmod_bo_export()
+          * still returns ENOTSUP, so do not advertise EXPORTABLE_BIT. */
+         pExternalBufferProperties->externalMemoryProperties =
+            (VkExternalMemoryProperties){
+               .externalMemoryFeatures =
+                  VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+               .exportFromImportedHandleTypes = 0,
+               .compatibleHandleTypes = supported_handle_types,
+            };
+      } else {
+         pExternalBufferProperties->externalMemoryProperties =
+            (VkExternalMemoryProperties){0};
+      }
       return;
    }
    if (pExternalBufferInfo->handleType ==
