@@ -449,9 +449,17 @@ kbase_kmod_bo_import(struct pan_kmod_dev *base, int fd)
    }
 
    int handle_fd = fd;
+   /* Stage 1: import through UMM and request explicit cache maintenance at
+    * map/unmap time.  The pan_kmod_bo_import() primitive has no flags
+    * argument, so the kbase backend carries this flag itself.  UNCACHED_GPU
+    * stays out of the default path; it is a stage-3 experiment.
+    */
+   const uint64_t import_flags =
+      BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR |
+      BASE_MEM_IMPORT_SYNC_ON_MAP_UNMAP;
    union kbase_ioctl_mem_import req = {
       .in = {
-         .flags = BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR,
+         .flags = import_flags,
          .phandle = (uintptr_t)&handle_fd,
          .type = BASE_MEM_IMPORT_TYPE_UMM,
       },
