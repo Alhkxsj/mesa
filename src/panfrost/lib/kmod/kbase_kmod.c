@@ -63,6 +63,10 @@ struct kbase_kmod_bo {
     * externally imported BOs keep a dup here so bo_export() can hand out a
     * fresh fd without involving the kernel. */
    int dmabuf_fd;
+   /* CPU mapping of dmabuf_fd, or NULL.  Kept separate from cpu_ptr: the
+    * latter is the kbase placement mapping (PROT_NONE for imported cookies)
+    * and cannot be used for CPU access. */
+   void *dmabuf_cpu;
 };
 
 static uint64_t
@@ -406,6 +410,7 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *base, struct pan_kmod_vm *vm,
       return NULL;
    }
    bo->dmabuf_fd = -1;
+   bo->dmabuf_cpu = NULL;
    uint64_t memory_flags = to_kbase_mem_flags(flags);
    uint64_t handle;
    if (dev->is_csf && pan_kmod_driver_version_at_least(&base->driver, 1, 9)) {
@@ -469,6 +474,8 @@ kbase_kmod_bo_free(struct pan_kmod_bo *base)
 {
    struct kbase_kmod_bo *bo = container_of(base, struct kbase_kmod_bo, base);
    pan_kmod_bo_cleanup(base);
+   if (bo->dmabuf_cpu)
+      munmap(bo->dmabuf_cpu, base->size);
    if (bo->cpu_ptr)
       munmap(bo->cpu_ptr, base->size);
    if (!bo->same_va) {
@@ -504,6 +511,7 @@ kbase_kmod_bo_import(struct pan_kmod_dev *base, int fd)
       return NULL;
    }
    bo->dmabuf_fd = -1;
+   bo->dmabuf_cpu = NULL;
 
    int handle_fd = fd;
    /* Stage 1: import through UMM and request explicit cache maintenance at
@@ -587,10 +595,21 @@ kbase_kmod_bo_import(struct pan_kmod_dev *base, int fd)
    }
 
    bo->dmabuf_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+   if (bo->dmabuf_fd >= 0) {
+      /* Keep a CPU mapping of the exporter's buffer.  External O_RDONLY
+       * imports fail here and simply keep NO_MMAP; dma-heap BOs have an
+       * O_RDWR fd and succeed. */
+      void *cpu = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                       bo->dmabuf_fd, 0);
+      if (cpu != MAP_FAILED)
+         bo->dmabuf_cpu = cpu;
+   }
    bo->memory_flags = req.out.flags;
    pan_kmod_bo_init(&bo->base, base, NULL, size,
                     PAN_KMOD_BO_FLAG_IMPORTED | PAN_KMOD_BO_FLAG_NO_MMAP,
                     previous + 1);
+   if (bo->dmabuf_cpu)
+      bo->base.flags &= ~PAN_KMOD_BO_FLAG_NO_MMAP;
    return &bo->base;
 
 error_free_import:
@@ -629,6 +648,14 @@ kbase_kmod_bo_mmap(struct pan_kmod_bo *base, int prot, int flags,
                     void *host_addr)
 {
    struct kbase_kmod_bo *bo = container_of(base, struct kbase_kmod_bo, base);
+   if (bo->dmabuf_cpu) {
+      if ((host_addr && host_addr != bo->dmabuf_cpu) || flags != MAP_SHARED ||
+          prot != (PROT_READ | PROT_WRITE)) {
+         errno = ENOTSUP;
+         return MAP_FAILED;
+      }
+      return bo->dmabuf_cpu;
+   }
    if ((base->flags & PAN_KMOD_BO_FLAG_NO_MMAP) ||
        (host_addr && host_addr != bo->cpu_ptr) || flags != MAP_SHARED ||
        prot != (PROT_READ | PROT_WRITE)) {
@@ -642,6 +669,8 @@ static int
 kbase_kmod_bo_munmap(struct pan_kmod_bo *base, void *host_addr, size_t size)
 {
    struct kbase_kmod_bo *bo = container_of(base, struct kbase_kmod_bo, base);
+   if (bo->dmabuf_cpu && host_addr == bo->dmabuf_cpu && size <= base->size)
+      return 0;
    uintptr_t address = (uintptr_t)host_addr;
    uintptr_t start = (uintptr_t)bo->cpu_ptr;
    if (!size || address < start || address - start >= base->size ||
