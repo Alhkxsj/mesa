@@ -49,18 +49,38 @@ panvk_wsi_init(struct panvk_physical_device *physical_device)
       to_panvk_instance(physical_device->vk.instance);
    VkResult result;
 
+   /* Software presentation is opt-in via PANVK_KBASE_WSI_SW.
+    * PANVK_KBASE_WSI_NATIVE selects the native X11/DRI3 path instead, which
+    * relies on the dma-heap export path. */
+   const bool sw_device =
+      getenv("PANVK_KBASE_WSI_SW") != NULL &&
+      getenv("PANVK_KBASE_WSI_NATIVE") == NULL;
+
+   /* Termux:X11 and Winlator present raw dma-buf FDs through the DRI3
+    * PixmapFromBuffers request with a private modifier (1274) and do not
+    * support DRI3 fences on that path.  PANVK_KBASE_DRI3=raw/termux and the
+    * WSI_X11_TERMUX=1 switch select it, matching the earlier mesa-mtk fork. */
+   const char *dri3_option = getenv("PANVK_KBASE_DRI3");
+   const char *termux_wsi = getenv("WSI_X11_TERMUX");
+   const bool termux_raw_dri3 =
+      !sw_device && !dri3_option && termux_wsi && strcmp(termux_wsi, "0") != 0;
+   const bool raw_fd_dri3 =
+      !sw_device &&
+      (termux_raw_dri3 ||
+       (dri3_option &&
+        (!strcmp(dri3_option, "raw") || !strcmp(dri3_option, "termux"))));
+
    result = wsi_device_init(&physical_device->wsi_device,
                             panvk_physical_device_to_handle(physical_device),
                             panvk_wsi_proc_addr, &instance->vk.alloc, -1,
                             &instance->drirc.options,
                             &(struct wsi_device_options){
-                               /* Software presentation is opt-in via
-                                * PANVK_KBASE_WSI_SW.  PANVK_KBASE_WSI_NATIVE
-                                * selects the native X11/DRI3 path instead,
-                                * which relies on the dma-heap export path. */
-                               .sw_device =
-                                  getenv("PANVK_KBASE_WSI_SW") != NULL &&
-                                  getenv("PANVK_KBASE_WSI_NATIVE") == NULL,
+                               .sw_device = sw_device,
+                               /* kbase cannot attach a GPU completion fence to
+                                * the exported dma-buf, so wait for rendering
+                                * before queueing the image for presentation. */
+                               .wait_present_before_queue = !sw_device,
+                               .x11_use_raw_fd_modifier = raw_fd_dri3,
                             });
    if (result != VK_SUCCESS)
       return result;

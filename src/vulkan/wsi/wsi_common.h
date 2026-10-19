@@ -115,6 +115,11 @@ struct wsi_device {
 
    bool disable_unordered_submits;
 
+   /* Wait for the image's GPU completion fence before handing it to the
+    * presentation engine.  Needed when the platform cannot attach a wait
+    * fence to the presented dma-buf. */
+   bool wait_present_before_queue;
+
    struct {
       /* Override the minimum number of images on the swapchain.
        * 0 = no override */
@@ -132,6 +137,10 @@ struct wsi_device {
 
       /* adds an extra minImageCount when running under xwayland */
       bool extra_xwayland_image;
+
+      /* Termux:X11/Winlator present raw dma-buf FDs through the DRI3
+       * PixmapFromBuffers request with a private modifier value. */
+      bool use_raw_fd_modifier;
 
       /* Never report VK_SUBOPTIMAL_KHR. Used to workaround
        * games that cannot handle SUBOPTIMAL correctly. */
@@ -267,6 +276,8 @@ struct wsi_device_options {
    bool sw_device;
    bool extra_xwayland_image;
    bool emulate_24as32;
+   bool wait_present_before_queue;
+   bool x11_use_raw_fd_modifier;
 };
 
 VkResult
