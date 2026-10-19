@@ -80,7 +80,9 @@ main(void)
    assert(create_instance(&invalid, NULL) == VK_ERROR_INITIALIZATION_FAILED);
    assert(!kbase_initializations && !drm_initializations);
    setenv("PAN_KMOD_RESTRICT_TO_BACKENDS", "kbase", 1);
-   assert(create_instance(&invalid, VK_KHR_SURFACE_EXTENSION_NAME) == VK_ERROR_EXTENSION_NOT_PRESENT);
+   /* Surface extensions are declared so the software presentation path can
+    * create a swapchain; without the opt-in nothing else claims them yet. */
+   assert(create_instance(&invalid, VK_KHR_SURFACE_EXTENSION_NAME) == VK_SUCCESS);
    VkInstance selected;
    assert(create_instance(&selected, NULL) == VK_SUCCESS);
    struct panvk_instance *instance = panvk_instance_from_handle(selected);
@@ -88,7 +90,7 @@ main(void)
    assert(instance->vk.physical_devices.enumerate == panvk_enumerate_kbase);
    assert(instance->vk.supported_extensions == &panvk_kbase_instance_extensions);
    assert(instance->vk.supported_extensions->KHR_get_physical_device_properties2);
-   assert(!instance->vk.supported_extensions->KHR_surface);
+   assert(instance->vk.supported_extensions->KHR_surface);
    setenv("PANVK_KBASE_DEVICE", "/dev/mali1", 1);
    setenv("PAN_KMOD_RESTRICT_TO_BACKENDS", "all", 1);
    assert(!strcmp(instance->kbase.path, "/dev/mali0"));

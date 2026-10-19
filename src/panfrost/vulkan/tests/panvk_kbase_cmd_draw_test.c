@@ -200,12 +200,19 @@ check_context_load(const uint64_t *commands, size_t before, unsigned reg, unsign
    assert(def.offset == offset && (def.mask & 3) == 3);
 }
 
+static enum mali_cs_sync_scope
+expected_signal_scope(bool kbase)
+{
+   return kbase ? MALI_CS_SYNC_SCOPE_SYSTEM : MALI_CS_SYNC_SCOPE_CSG;
+}
+
 static void
-check_sync_add(const uint64_t *commands, size_t index, unsigned offset)
+check_sync_add(const uint64_t *commands, size_t index, unsigned offset,
+               bool kbase)
 {
    struct MALI_CS_SYNC_ADD64 p;
    MALI_CS_SYNC_ADD64_unpack((const struct mali_cs_sync_add64_packed *)&commands[index], &p);
-   assert(p.error_propagate && p.scope == MALI_CS_SYNC_SCOPE_CSG);
+   assert(p.error_propagate && p.scope == expected_signal_scope(kbase));
    assert(p.defer_mode == MALI_CS_DEFER_MODE_DEFER_INDIRECT);
    struct reg_definition value = last_definition(commands, index, p.data);
    assert(value.opcode == MALI_CS_OPCODE_MOVE48 && value.immediate == 1);
@@ -238,7 +245,8 @@ check_fragment_operands(const uint64_t *commands, size_t count, bool kbase,
    assert(!fragment.enable_tem && fragment.tile_order == MALI_TILE_RENDER_ORDER_Z_ORDER);
    struct MALI_CS_SYNC_ADD32 give_back;
    MALI_CS_SYNC_ADD32_unpack((const struct mali_cs_sync_add32_packed *)&commands[release], &give_back);
-   assert(give_back.error_propagate && give_back.scope == MALI_CS_SYNC_SCOPE_CSG);
+   assert(give_back.error_propagate &&
+          give_back.scope == expected_signal_scope(kbase));
    assert(give_back.defer_mode == MALI_CS_DEFER_MODE_DEFER_INDIRECT);
    check_context_load(commands, release, give_back.address,
                       offsetof(struct panvk_cs_subqueue_context, render.desc_ringbuf.syncobj));
@@ -248,7 +256,8 @@ check_fragment_operands(const uint64_t *commands, size_t count, bool kbase,
    assert(bytes.opcode == MALI_CS_OPCODE_MOVE32 && bytes.immediate == expected);
    size_t final_sync = find_opcode(commands, count, MALI_CS_OPCODE_SYNC_ADD64, release + 1);
    assert(final_sync != SIZE_MAX);
-   check_sync_add(commands, final_sync, PANVK_SUBQUEUE_FRAGMENT * sizeof(struct panvk_cs_sync64));
+   check_sync_add(commands, final_sync,
+                  PANVK_SUBQUEUE_FRAGMENT * sizeof(struct panvk_cs_sync64), kbase);
    unsigned handlers = 0, oom_stores = 0, pointer_stores = 0;
    for (size_t i = 0; i < count; i++) {
       switch (commands[i] >> 56) {
@@ -350,7 +359,7 @@ check_command_streams(const uint64_t *vt, size_t vt_count,
    }
    assert(count_heap_operation(vt, vt_count,
       MALI_CS_HEAP_OPERATION_VERTEX_TILER_STARTED) == 1);
-   check_sync_add(vt, sync_add, 0);
+   check_sync_add(vt, sync_add, 0, kbase);
    check_fragment_operands(frag, frag_count, kbase, layers,
                            sync_wait, run_fragment, release_sync);
    assert(count_opcode(vt, vt_count, MALI_CS_OPCODE_FINISH_TILING) == 1);

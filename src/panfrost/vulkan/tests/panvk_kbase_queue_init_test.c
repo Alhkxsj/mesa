@@ -242,6 +242,42 @@ kbase_csf_queue_seqno_va(struct kbase_csf_queue *queue)
    return 0x400000 + queue->id * 4096 + (queue->id == fixture.bad_seqno ? 1 : 0);
 }
 
+const void *
+kbase_csf_queue_seqno_map(struct kbase_csf_queue *queue)
+{
+   return NULL;
+}
+
+uint64_t
+kbase_csf_queue_published_target(struct kbase_csf_queue *queue)
+{
+   return 0;
+}
+
+uint64_t
+kbase_csf_queue_published_insert(struct kbase_csf_queue *queue)
+{
+   return 0;
+}
+
+uint64_t
+kbase_csf_queue_extract(struct kbase_csf_queue *queue)
+{
+   return 0;
+}
+
+uint32_t
+kbase_csf_queue_active(struct kbase_csf_queue *queue)
+{
+   return 0;
+}
+
+const void *
+kbase_csf_queue_ring_map(struct kbase_csf_queue *queue, uint64_t *size)
+{
+   return NULL;
+}
+
 uint32_t
 kbase_csf_context_flush_id(struct kbase_csf_context *ctx)
 {

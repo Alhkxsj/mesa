@@ -181,6 +181,42 @@ kbase_csf_queue_seqno_va(struct kbase_csf_queue *queue)
    return 0x400000;
 }
 
+const void *
+kbase_csf_queue_seqno_map(struct kbase_csf_queue *queue)
+{
+   return NULL;
+}
+
+uint64_t
+kbase_csf_queue_published_target(struct kbase_csf_queue *queue)
+{
+   return 0;
+}
+
+uint64_t
+kbase_csf_queue_published_insert(struct kbase_csf_queue *queue)
+{
+   return 0;
+}
+
+uint64_t
+kbase_csf_queue_extract(struct kbase_csf_queue *queue)
+{
+   return 0;
+}
+
+uint32_t
+kbase_csf_queue_active(struct kbase_csf_queue *queue)
+{
+   return 0;
+}
+
+const void *
+kbase_csf_queue_ring_map(struct kbase_csf_queue *queue, uint64_t *size)
+{
+   return NULL;
+}
+
 void
 pan_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
 {
@@ -313,6 +349,9 @@ kbase_csf_wait(struct kbase_csf_queue *const *queues, uint32_t count,
 int
 main(void)
 {
+   /* This test covers the renewal path itself, so force it on the first
+    * graphics submission instead of waiting for the production interval. */
+   setenv("PANVK_KBASE_TEST_HEAP_INTERVAL", "1", 1);
    struct panvk_device device = {0};
    struct panvk_gpu_queue queue = {0};
    struct pan_kmod_dev kdev = {.ops = &kbase_kmod_ops};
