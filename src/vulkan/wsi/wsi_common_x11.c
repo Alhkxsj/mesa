@@ -3072,7 +3072,7 @@ static VkResult x11_wait_for_present(struct wsi_swapchain *wsi_chain,
       int ret = u_cnd_monotonic_timedwait(&chain->present_progress_cond,
                                           &chain->present_progress_mutex,
                                           &abs_timespec);
-      if (ret == ETIMEDOUT) {
+      if (ret == thrd_timedout) {
          result = VK_TIMEOUT;
          break;
       }
