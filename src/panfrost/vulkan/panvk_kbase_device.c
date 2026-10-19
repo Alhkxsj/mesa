@@ -159,6 +159,8 @@ panvk_kbase_physical_device_capabilities(struct vk_device_extension_table *exten
       extensions->EXT_tooling_info = kbase_experiment("VK_EXT_tooling_info");
       extensions->EXT_private_data = !rollback_1_0 || kbase_experiment("VK_EXT_private_data");
       extensions->EXT_debug_marker = kbase_experiment("VK_EXT_debug_marker");
+      extensions->KHR_dynamic_rendering =
+         kbase_experiment("apiVersion1.3") && kbase_experiment("dynamicRendering");
    }
    if (features) {
       *features = (struct vk_features){
@@ -185,6 +187,8 @@ panvk_kbase_physical_device_capabilities(struct vk_device_extension_table *exten
        * retesting candidates and for an explicit apiVersion1.0 rollback. */
       const bool rollback_1_0 = kbase_experiment("apiVersion1.0");
       const bool rollback_1_1 = kbase_experiment("apiVersion1.1");
+      const bool api13 = !rollback_1_0 && !rollback_1_1 &&
+                         kbase_experiment("apiVersion1.3");
       const bool api12 = !rollback_1_0 && !rollback_1_1 &&
                          kbase_experiment("apiVersion1.2");
       features->storageBuffer16BitAccess = !rollback_1_0;
@@ -245,6 +249,10 @@ panvk_kbase_physical_device_capabilities(struct vk_device_extension_table *exten
 
       /* Hard constraint: kbase sync type has no timeline support. */
       features->timelineSemaphore = false;
+
+      /* Vulkan 1.3: dynamic rendering is the first verified 1.3 feature. */
+      features->dynamicRendering =
+         api13 && kbase_experiment("dynamicRendering");
    }
 }
 
@@ -265,8 +273,9 @@ panvk_kbase_physical_device_properties(struct vk_properties *properties)
    properties->apiVersion = kbase_experiment("apiVersion1.0") ?
       VK_API_VERSION_1_0 :
       (kbase_experiment("apiVersion1.1") ? VK_API_VERSION_1_1 :
-       (kbase_experiment("apiVersion1.2") ? VK_API_VERSION_1_2 :
-        VK_API_VERSION_1_1));
+       (kbase_experiment("apiVersion1.3") ? VK_API_VERSION_1_3 :
+        (kbase_experiment("apiVersion1.2") ? VK_API_VERSION_1_2 :
+         VK_API_VERSION_1_1)));
    properties->conformanceVersion = (VkConformanceVersion){0};
    properties->timestampComputeAndGraphics = false;
    properties->timestampPeriod = 1.0f;
