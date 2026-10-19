@@ -194,3 +194,195 @@
 | 2026-10-18 | **环境实测**：`Xvfb` 已装（2:21.1.16）、启动 `:98` 后 23 个扩展**含 MIT-SHM**、**不含 DRI3**；`weston`/`Xwayland` 也已装；`libxcb1-dev`/`libx11-xcb-dev` 已装 | Xvfb 缺 DRI3 对 `sw_device` 路径不成问题。路线 A 的环境障碍比预想小 | `xdpyinfo` 实测 | 已验证（环境） |
 | 2026-10-18 | **无 render node、无 vgem**：`/dev/dri/card0` 是 `mediatek-drm`（显示控制器）不是 Mali，`/dev/dri/renderD*` 不存在，`vgem` 未加载（`modinfo` 无输出） | ⇒ DRI3/辅助 render node 路线**不可行**。且即使可行，Mali 结果仍要过 CPU 才能进辅助 buffer，无性能优势 | 设备节点与 `lsmod` | 已验证（环境） |
 | 2026-10-18 | **当前构建未启用 X11 平台**：`platforms = []`，`wsi_common_x11.c` 未编译 | ⇒ 走路线 A 需要重配 meson 加 `-Dplatforms=x11`，不只是改代码 | `meson-info/intro-buildoptions.json` | 已验证（构建配置） |
+
+| 2026-10-19 | ⭐ **wait 循环里的 `KBASE_IOCTL_MEM_SYNC` 会饿死 CSG 调度**：原 `kbase_csf_wait()` 每 1 ms 对 seqno BO 做一次 `FLUSH_AND_INVALIDATE`，即每秒上千次发在**同一个 `/dev/mali0` fd** 上；该 fd 同时是内核调度 queue group 的通道。表现为 fragment 子队列的 `CS_EXTRACT` 停在最后一条 ring entry 前 80 字节（正好是 `WAIT 0xffff` + `SYNC_ADD64` 的尾部），`CS_ACTIVE=0`，seqno 恰为 target-1，err=0，任何时长（含 30 s）都不恢复 | 改为用户态 `dc civac` + `dsb sy`（与参考实现一致，无 ioctl）后：clear 0/12 → 11/12，vertex 约 4/12 → 9/12 且 370+ FPS | `src/panfrost/lib/kmod/kbase_csf.c` `cache_invalidate_range()`；`/tmp/ci*.log`、`/tmp/lx*.log` | 已验证（真机） |
+| 2026-10-19 | ⭐ **kbase 上跨子队列同步必须用 SYSTEM 作用域**：我们给每个子队列建独立的 queue group（3 个 CSG），`MALI_CS_SYNC_SCOPE_CSG` 的信号 fragment 收不到，VT→frag 的依赖永远不满足 | 对应 G925 补丁 077。`panvk_instr.h` 新增 `panvk_cs_signal_scope()`，在 `PANVK_INSTR_SYNC_OPS` 宏内把 CSG 重映射为 SYSTEM，并改掉 `cmd_draw/cmd_event/cmd_query/cmd_buffer` 里的直接 `cs_sync32_*` 调用点 | `src/panfrost/vulkan/csf/panvk_instr.h`、`panvk_vX_cmd_{draw,event,query,buffer}.c` | 已验证（真机） |
+| 2026-10-19 | **每次图形提交都换 tiler heap 代价极高**：原实现对每个 graphics submit 做 `kbase_graphics_heap_create` + rearm（两次阻塞提交）+ 销毁旧 heap，等价于每帧多一次 GPU 往返 | 改为每 128 次图形提交换一次（参考实现 `KBASE_TILER_HEAP_RENEW_INTERVAL`）后，512x512 vertex 从 116 FPS 升到 355–393 FPS | `csf/panvk_kbase_compute_queue.inc` `renew_heap`；`/tmp/vx*.log` | 已验证（真机） |
+| 2026-10-19 | ⭐ **`wsi_common_x11.c` 的 present 超时判断是错的**：`u_cnd_monotonic_timedwait()` 只返回 `thrd_timedout`，从不返回 `ETIMEDOUT`（`src/util/cnd_monotonic.c:137`），所以超时分支永不命中，落到 `VK_ERROR_DEVICE_LOST` | 对应 G925 补丁 084。已改为 `thrd_timedout` | `src/vulkan/wsi/wsi_common_x11.c:3075` | 已验证（源码） |
+| 2026-10-19 | ⚠️ **不能在 vkmark 运行期间覆盖 `/tmp/kbase-icd/libvulkan_panfrost.so`**：`cp` 会截断正在被 mmap 的文件，进程收到 SIGBUS，看起来像驱动崩溃 | 部署 ICD 前先确认没有测试在跑 | `/tmp/lv11.log`（Bus error） | 已验证（真机） |
+| 2026-10-19 | ⭐ **kbase 异步提交已接通，用 `PANVK_KBASE_ASYNC_SUBMIT=1` 开启**：`kbase_compute_submit` 发布后立即返回，signal 用 `panvk_kbase_sync_set_pending(&kbase_completion_ops, queue, targets)` 挂成 completion。`ops.wait` 必须把"时间片到期"翻译成 `VK_TIMEOUT`，否则 sync 层的 5ms 分片会被当成设备丢失（首版 10/10 全挂就是这个） | 实测 512x512 vertex：同步 317 FPS / 异步 253 FPS，两者 10/10 通过。**异步更慢**，因为 SHM 软件呈现本来就要等这一帧；而且残余卡死会从"5 秒后 DEVICE_LOST"变成"fence 永不就绪"（无限等待）。所以默认仍关 | `csf/panvk_kbase_compute_queue.inc` `kbase_completion_wait`；`/tmp/as*.log`、`/tmp/sy2_*.log` | 已验证（真机） |
+| 2026-10-19 | **ring 满时必须等待再重试**：异步模式下 CPU 会跑到 GPU 前面，64 KiB 的 userspace ring 会填满，`queue_prepare_locked` 返回 `EAGAIN`。已加"等当前 published target 再重试"的循环 | 否则表现为 "kbase submission failed" | 同左 | 已验证（源码 + 真机） |
+| 2026-10-19 | **单测需同步更新**：`panvk_kbase_compute_queue_test` 用 `PANVK_KBASE_TEST_HEAP_INTERVAL=1` 保持覆盖 heap 更新路径；`panvk_kbase_cmd_draw_test` 的 `check_sync_add` 现在按 kbase/非 kbase 断言 CSG 或 SYSTEM 作用域 | 86/86 通过 | `tests/panvk_kbase_{compute_queue,cmd_draw}_test.c` | 已验证（单测） |
+
+
+## 更正记录（续）
+
+| 日期 | 原条目 | 更正为 | 依据 |
+|---|---|---|---|
+| 2026-10-19 | 2026-10-18「⭐ U1 源码裁决：kbase 的 started-only heap 统计是安全的」条目结尾称：**「kbase 跳过 `cs_set_exception_handler(TILER_OOM)` ⇒ 校验根本不会执行」** | **该结论不成立。** 校验在 `handle_oom_event()` 内，只要固件发出 `CS_REQ.TILER_OOM` 就会执行；`group->csi_handlers & BASE_CSF_TILER_OOM_EXCEPTION_FLAG` 只决定「增量渲染」那一个分支（`pending_frag_count == 0 && (err == -ENOMEM \|\| err == -EBUSY)`），**不影响**前面的堆统计校验，也不影响 `kbase_csf_tiler_heap_alloc_new_chunk()` 与 `validate_allocation_request()`。跳过用户态 TILER_OOM handler 只是让内核走普通 chunk-grow 路径 | `mt6991-kernel-src/.../csf/mali_kbase_csf.c:2075-2096`（统计校验与 alloc 调用都在 `csi_handlers` 判断之前）、`:2089-2096`（csi_handlers 分支）、`csf/mali_kbase_csf_tiler_heap.c:905-937`（`validate_allocation_request`） | 已验证（官方 GPL 源码，2026-10-19 复核） |
+| 2026-10-19 | ⚠️ **syncobjs 初始 seqno 1 → 16 的"余量"实验**（`csf/panvk_kbase_compute_queue.inc` `kbase_compute_init` **仅此一处**，wait 条件未动）：fragment 的 `wait_finish_tiling` 用 `GREATER`，设计上只靠 init 的 **1 个单位**余量（`cell0 = 1 + 已执行 flush 数` vs `target = 申报 flush 数`）。改为 16 后，vertex 512×512 `-d 2` 连跑 **10/10 通过**，FPS 282–340；此前同条件约 10–15% 偶发 `VK_ERROR_DEVICE_LOST` | **只证明"余量掩盖了问题"，不证明根因已定位。** 副作用：前 15 次 tiler flush 之前，fragment 的等待会无条件成立（`cell0=16 > target`），即早期帧**不再等待 VT**；vkmark 下未观察到故障，但这是真实风险，不能当正式修法 | `/tmp/buf10_1..10.log`；对照 `/tmp/v2_3.log`（`cell0=419` vs `frag_target=844`，说明 cell 计的是 **tiler flush 次数**，不是 ring 提交次数，两者约 2:1） | 已验证（真机 10 次）；根因**未定位** |
+
+## 调试发现（续 2026-10-19：kick 与 sync 重估）
+
+| 日期 | 发现 | 含义 | 证据 | 状态 |
+|---|---|---|---|---|
+| 2026-10-19 | ⭐ **`KBASE_IOCTL_CS_QUEUE_KICK` 在"组挂起于 sync wait"时是纯空操作**：`kbase_csf_queue_kick` 只把 queue 挂到 `pending_gpuq_kick_queues`；调度线程的 `kbase_csf_process_queue_kick` → `kbase_csf_scheduler_queue_start`，其中 `group->run_state == SUSPENDED_ON_WAIT_SYNC && CS_STATUS_WAIT_SYNC_WAIT_GET(queue->status_wait)` 分支只打一句 `dev_dbg("blocked queue ... was kicked")` 就返回 0，**不调度、不写任何 doorbell**。只有非该分支且组在 slot 且 `cs_enabled` 时才 `kbase_csf_ring_cs_user_doorbell`（写该 queue 的 `DOORBELL` 寄存器）；组不在 slot 则仅置为 runnable，等下一次 tick 重新编程 CSG | 每个子队列一个 CSG + 单 queue 的布局下，fragment 阻塞时被踢的正是这个 queue，`status_wait` 非零 ⇒ 500 ms 一次的 rekick 全部被吞掉，30 s 无效可完全由这条解释。`CS_QUEUE_KICK` 与 `CS_DOORBELL` **不等价**（至少在这个关键状态） | `mt6991-kernel-src/mali-r49p1/.../csf/mali_kbase_csf.c:945-992, 3886-3930`；`csf/mali_kbase_csf_scheduler.c:2093-2122` | 已验证（GPL 源码） |
+| 2026-10-19 | ⭐ **kbase 自己写明了 sync wait 的重估触发条件是"任意 CS_DOORBELL/GLB_DOORBELL 写入"**：`kbase_csf_event_signal` 注释 "Write to GLB_DOORBELL would suffice as spec says that all pending synch object wait operations are re-evaluated on a write to any CS_DOORBELL/GLB_DOORBELL register"；`KBASE_IOCTL_CS_EVENT_SIGNAL` → `kbasep_cs_event_signal` → `kbase_csf_event_signal_notify_gpu` → 写 `CSF_KERNEL_DOORBELL_NR` **并且**跑 event callbacks → `check_group_sync_update_worker`（对 `idle_wait_groups` 逐组 `evaluate_sync_update`，满足则移回 runnable） | 这条 ioctl 是内核提供的"请重估所有 sync wait"的用户态杠杆，我们的 rekick 没有用它。对**离槽**的等待组，唯一能把组移回 runnable 的是 host 侧 sync-update worker，其触发源只有 CQS_SET / CS_EVENT_SIGNAL / CSG_REQ_SYNC_UPDATE 回调（固件在组离槽后无法发这个请求） | `csf/mali_kbase_csf_event.c:93-150`；`mali_kbase_core_linux.c:1455-1458`；`csf/mali_kbase_csf_scheduler.c:7033-7113` | 已验证（GPL 源码） |
+| 2026-10-19 | **kbase 的 CSG 中断处理末尾不写 doorbell，panthor 每次都写**：`process_csg_interrupts` 以 `process_cs_interrupts` 结束，无 doorbell；kbase 只在异常路径（CS fault 2783/2910、tiler OOM 2234）补 ring。panthor `sched_process_csg_irq_locked` 末尾无条件 `panthor_fw_ring_csg_doorbells(ptdev, BIT(csg_id))`，且 `CSG_SYNC_UPDATE` 还会 queue `sync_upd_work` | panthor 的"每次 CSG 事件后补门铃"在 kbase 不存在 ⇒ 之前"假设成立一半"更新为：缺门铃成立，但 kbase 的设计替代物是 host 侧 sync-update worker（需用户态触发），不是 CSG IRQ 里补 ring | `mt6991-kernel-src/.../csf/mali_kbase_csf.c:3198-3250`；`/home/zl/github/mali-re/外部参考/panthor主线源码/panthor_sched.c:1815-1839` | 已验证（源码对照） |
+| 2026-10-19 | **VT 的 SYNC_ADD64 对 fragment 的可见性不构成 coherency 问题**：写侧 `panvk_cs_signal_scope()` 在 kbase 上返回 SYSTEM，`PANVK_INSTR_SYNC_OPS` 把 CSG 重映射为 SYSTEM；实测发射字低字节 `0x01`（scope 位 [2:1]=0）。读侧 `cs_sync64_wait` **没有 scope 操作数**，不存在"CSG 域读"与"System 域写"的矛盾。两侧用同一个 `ctx.syncobjs` 设备地址（同一 `panvk_cs_subqueue_context`、同一 kctx/AS） | GPU→GPU、同一 L2、System 域写 + 无域限定的等待；另有 `panvk_priv_mem_write` 对 `WB_MMAP` 池在写完即 flush（init 的 seqno 对 GPU 可见）。SYNCOBJS 诊断从 CPU 侧读回也看到了 GPU 递增后的值 ⇒ 可见性正常，剩余偏差是计数/申报问题，不是缓存问题 | `src/panfrost/vulkan/csf/panvk_instr.h:94-150`；`panvk_vX_cmd_draw.c:4270-4285`；`panvk_kbase_compute_queue.inc:457-465`；`panvk_mempool.h:180-192`；`panvk_vX_device.c:76-90` | 已验证（源码 + 真机诊断） |
+
+### 候选 B 静态核查（2026-10-19）：panvk 从不触发 host 侧 sync-update
+
+| 日期 | 发现 | 含义 | 证据 | 状态 |
+|---|---|---|---|---|
+| 2026-10-19 | ⭐ **panvk 生产路径没有任何 `kbase_csf_event_signal_notify_gpu` 触发**：`src/panfrost/lib/kmod/kbase_csf.c` 使用的 ioctl 全集为 REGISTER/BIND/GROUP_CREATE/KICK/TERMINATE/GET_GLB_IFACE/MEM_SYNC/KCPU_*，**没有 `KBASE_IOCTL_CS_EVENT_SIGNAL`**（仅 `tests/panvk_kbase_device_probe.inc:523` 枚举过）；没有 CQS_SET；KCPU 只定义 `FENCE_SIGNAL`/`CQS_WAIT`，且生产唯一调用点 `panvk_kbase_compute_queue.inc:111-120` 被 `PANVK_DEBUG(KCPU_EVENT)` 门控、只对 compute 子队列。内核侧 notify_gpu 只有两处：`CS_EVENT_SIGNAL` handler（`mali_kbase_core_linux.c:1455-1458`）与 CQS_SET/CQS_SET_OPERATION（`csf/mali_kbase_csf_kcpu.c:983,1304`）；`FENCE_SIGNAL` 只 `dma_fence_signal`，不通知 GPU（`:1906-1975`） | ⇒ fragment 组挂起后没有任何 host 事件把它移回 runnable。**候选 B 成立且独立于"计数差 1"**：即使 add/target 完全对齐，只要 VT 的 add 在 fragment 组离槽之后落地，就无人重估 | `src/panfrost/lib/kmod/kbase_csf.c`（ioctl 全集）、`panvk_kbase_compute_queue.inc:96-123`；GPL 源码如上 | 已验证（源码） |
+| 2026-10-19 | **`flush_tiling` / `issue_fragment_jobs` 全程只发 CS 指令，无 host 调用**：前者发 `cs_finish_tiling` + `PANVK_INSTR_SYNC_ADD64` + 递增 `relative_sync_point`；后者只做 frag 上下文/FBD/tiler-OOM 的 CS 发射。两者都在 build 阶段，提交仍在 `kbase_compute_execute`，且提交后到 `kbase_csf_wait` 之间没有任何 sync-update 触发 | ⇒ B 的修复点不在绘制路径，只能在提交/等待路径补一次内核级信号 | `panvk_vX_cmd_draw.c:4213-4250, 4487-4545` | 已验证（源码） |
+| 2026-10-19 | **最小修复方向（未实施）**：在 `kbase_csf_wait()` 的周期分支（`kbase_csf.c:1095-1109`，当前每 500 ms 对所有未达 target 的队列发 `KBASE_IOCTL_CS_QUEUE_KICK`）改为**每周期发一次 `KBASE_IOCTL_CS_EVENT_SIGNAL`**（`_IO(KBASE_IOCTL_TYPE, 44)`，无载荷），kick 可保留作为调度兜底。该 ioctl → `kbasep_cs_event_signal` → `kbase_csf_event_signal_notify_gpu` → ①GPU 上电时写 `CSF_KERNEL_DOORBELL_NR`（固件重估驻留 CSG 的 wait）；②callbacks → `check_group_sync_update_worker` → 对 `idle_wait_groups` 逐组 `evaluate_sync_update`，满足则 `remove_group_from_idle_wait` + 移回 runnable。触发不必每帧：与现有 500 ms 周期同频即可，避免在 VT add 落地前过早求值 | 副作用：`kbase_csf_event_signal` 会 `atomic_set(event_count)` + `kbase_event_wakeup`，我们的 fd 不 poll 它，无实际影响；GPU 睡眠时只跑 host 侧求值，仍有效 | `mali_kbase_core_linux.c:1455`；`mali_kbase_csf_event.c:93-150`；`mali_kbase_csf_scheduler.c:7048-7113` | 待验证（设计） |
+
+### 候选 B 修复验证（2026-10-19）
+
+| 日期 | 发现 | 含义 | 证据 | 状态 |
+|---|---|---|---|---|
+| 2026-10-19 | **已实现**：kmod 层新增 `kbase_csf_event_signal()`（`_IO(KBASE_IOCTL_TYPE,44)`），在 `kbase_csf_wait()` 的 500 ms 周期分支里**每周期发一次**，`CS_QUEUE_KICK` 循环保留作调度兜底 | 该 ioctl 同时做两件事：GPU 上电时写 GLB doorbell；触发 host 侧 `check_group_sync_update_worker` 对 `idle_wait_groups` 重估。每 5 s 等待窗口最多 10 次，开销可忽略 | `src/panfrost/lib/kmod/kbase_csf.c`（wrapper + rekick 分支）、`kbase_csf.h` | 已验证（构建） |
+| 2026-10-19 | **第一轮（init 16 + signal）**：vertex 512×512 `-p fifo` duration 2，**10/10 通过**，FPS 309–322 | 与 init 16 加 signal 之前的 10/10 相同，无回退 | `/tmp/sig_r1_1..10.log` | 已验证（真机 10 次） |
+| 2026-10-19 | ⭐ **第二轮（init 1 + signal）**：同条件 **6/10 通过，4 次 `VK_ERROR_DEVICE_LOST`**（`kbase completion failed`，vkmark `waitIdle` abort）。按日志 mtime 推算：失败 run 耗时 6–7 s、通过 run 2–3 s ⇒ 失败走的是 5 s 等待超时路径，**不是 signal ioctl 立即报错** | ⇒ **A 与 B 叠加，B 单独不是根因**。CS_EVENT_SIGNAL 不能消除 init 1 下的等待失败；init 16 仍需作为独立缓解保留（已恢复源码为 16 并重新部署） | `/tmp/sig_r2_1..10.log`；`stat -c %Y` 时间差 | 已验证（真机 10 次） |
+| 2026-10-19 | **proves**：在 512×512/vertex/fifo/duration2 条件下，补 CS_EVENT_SIGNAL 后 init 1 仍有 4/10 失败。**does_NOT_prove**：①根因已完全定位（未消除）；②signal 使失败频率如何变化——没有同条件"init 1 且无 signal"的对照（历史数据用的是 256×256/clear 等不同条件），不能声称频率变好或变差；③失败仍属同一 C3 机制（超时路径一致，但未再抓 groups/SYNCOBJS 现场） | 结论边界必须随后续实验更新 | 同上 | 已验证（实验 + 推理） |
+
+### 状态封存：init 16 + CS_EVENT_SIGNAL（2026-10-19）
+
+| 项 | 内容 | 依据 |
+|---|---|---|
+| 当前部署 | `syncobjs` init seqno = **16**；`kbase_csf_wait()` 周期分支每 500 ms 发一次 `KBASE_IOCTL_CS_EVENT_SIGNAL`，`CS_QUEUE_KICK` 保留。源码与 `/tmp/kbase-icd/libvulkan_panfrost.so` 一致（`cmp` 通过） | `panvk_kbase_compute_queue.inc:463`、`kbase_csf.c:1102`；`cmp` |
+| 状态标注 | **工程缓解，根因未完全定位。** A（计数/申报差，init 余量可掩盖）与 B（离槽等待组缺 host 重估触发）叠加；signal 在理论上正确（GLB doorbell + host sync-update worker），但**当前条件下无独立可观测贡献** | 两轮结果（init16 10/10；init1 6/10，失败为 5 s 超时路径） |
+| 已知副作用 | init 16 使**前 15 次 tiler flush 之前 fragment 不再等待 VT**（早期帧同步弱化）。vkmark 下未观察到故障，但这是真实风险 | 缓冲实验 |
+| 对照缺口 | 缺“init 1 且无 signal”的同条件对照。因此只能断言：**在 init 16 下 signal 不改变结果**；不能断言 signal 无效 | 本轮未运行该对照 |
+| proves | ①init 16 下两轮均为 10/10（含 signal）；②init 1 下补 signal 仍 4/10 失败，失败走 5 s 等待超时路径 | `/tmp/sig_r1_*`、`/tmp/sig_r2_*`、mtime 差 |
+| does_NOT_prove | ①根因已完全定位；②signal 对失败频率的作用（无同条件对照）；③失败仍严格为 C3 同一现场（未重抓 groups/SYNCOBJS）；④前 15 帧同步正确性 | 同上 |
+| 复追条件 | 仅在 **init 16 下再次复现卡死/DEVICE_LOST** 时重新追根因；否则不再投入 | 决策规则 |
+| 边界 | 未碰 WSI/U7/级 C；未动 `panvk_kbase_sync_type` 与 5 处 heap 跳过；异步仍只在 `PANVK_KBASE_ASYNC_SUBMIT=1` 后 | — |
+
+## M1 多场景稳定性（2026-10-19）
+
+| 场景 | 次数 | 通过 | 失败 | FPS 范围 | 失败形态 |
+|---|---|---|---|---|---|
+| vertex 512×512, fifo, duration 2 | 10 | 10 | 0 | 299–354 | — |
+| clear 512×512, fifo, duration 2 | 10 | 10 | 0 | 312–331 | — |
+| texture 512×512, fifo, duration 2 | 10 | 10 | 0 | 317–436 | — |
+
+三种 workload 合计 30/30，无新失败形态。命令统一：`vkmark --winsys xcb -s 512x512 -p fifo -b <scene>:duration=2`，环境同前（`PANVK_KBASE_WSI_SW=1`、`PANVK_KBASE_DEVICE=/dev/mali0`、`PAN_KMOD_RESTRICT_TO_BACKENDS=kbase`、`DISABLE_WSI_LAYER=1`）。日志 `/tmp/m1_<scene>_1..10.log`。
+
+## 当前能力清单（截至 2026-10-19，仅列真机验证过的内容）
+
+| 类别 | 已验证（真机） | 未验证 / 不承诺 |
+|---|---|---|
+| vkmark | vertex/clear/texture 各 10/10；此前 7 个场景均可跑，300–325 FPS | 长时间稳定性（>2 s/次）、并发多进程、suspend/resume |
+| 像素/绘制 | `CmdClearColorImage` 像素精确；完整图形管线三角形；VAF（stride/格式/插值）；索引绘制；深度测试/写/回读且与绘制顺序无关；索引+纹理+深度组合 | MSAA、多 render pass、secondary command buffer、动态渲染（扩展未声明） |
+| 纹理 | 单 binding 的 8×8 RGBA8 + COMBINED_IMAGE_SAMPLER；nearest/linear；aniso（含 mip 链）；线性布局 rowPitch | cubemap/数组/多采样器/多 set、动态偏移、压缩格式、其他格式 |
+| Feature 声明 | samplerAnisotropy、depthClamp、depthBiasClamp、independentBlend（各有真机探针） | 其余 feature/extension 声明为零；apiVersion 仅 1.0 |
+| 同步/调度 | 跨子队列 SYSTEM scope；tiler heap 128 次续期；无 ioctl 风暴的等待；init16 + CS_EVENT_SIGNAL 工程缓解；异步提交（开关后） | A+B 根因未定位；前 15 次 flush 的早期帧不等 VT；异步默认关且更慢 |
+| WSI | X11 MIT-SHM 软件呈现（sw_device）可上屏跑 vkmark | 原生 swapchain、Wayland/KMS、Android surface、dma-buf 导出/导入实际使用 |
+| 计算 | 仅内部 clear 使用；应用级 compute pipeline/dispatch/SSBO/原子 | 全部未验证 |
+| GL | — | **被挡**：无 `/dev/dri/renderD*`、kbase 非 DRM，panfrost Gallium 无法挂接 |
+
+已知限制汇总：①内核无 dma-buf exporter，WSI 只能走软件呈现且需 `PANVK_KBASE_WSI_SW=1`；②扩展/feature 声明极窄，依赖扩展的应用无法运行；③无 render node ⇒ GL 不可用；④异步提交非默认；⑤无 TILER_OOM 处理路径（5 处 heap 跳过是必需）；⑥vkmark 在 `vkAcquireNextImageKHR` 上有一条 semaphore 复用的 Validation 报错（未修）。
+
+## M2-A 最小应用选型（2026-10-19）
+
+| 应用 | 结论 | 证据 / 原因 |
+|---|---|---|
+| `vkcube`（vulkan-tools 1.4.304） | ⭐ **选用并跑通** | 经典最小 demo：单 render pass、单 UBO 描述符、深度缓冲、无 compute/MSAA/动态渲染；只需 `VK_KHR_swapchain`（`PANVK_KBASE_WSI_SW=1` 时声明）与 xcb surface。60 帧 `--c 60` 退出码 0；30 帧 `--validate` 退出码 0 且 0 条 Validation Error；长跑时 `xwininfo` 确认映射出 512×512 窗口（`0x200000 ... 512x512+100+100`） | `/tmp/m2a_vkcube.log`、`/tmp/m2a_vkcube_validate.log`、`xwininfo` |
+| `vkcubepp` | 可跑 | 同参数 60 帧退出码 0 | `/tmp/m2a_vkcubepp.log` |
+| `vkgears` | 失败（记录，不深挖） | 打印 conformant 警告后立即 **SIGSEGV**（rc=139），未进入设备/交换链输出；疑与其所需 feature/扩展在当前 kbase 声明下为零有关，按约定不调查 | `/tmp/m2a_vkgears.log` |
+| `vulkaninfo` | 仅诊断工具 | 已安装，不作为 workload | — |
+| SaschaWillems samples / vkQuake 等 | 不在本机 | 需联网获取并构建，且多数依赖未声明 feature/扩展；未采用 | — |
+
+运行环境与 vkmark 一致：`DISPLAY=:110`、`VK_ICD_FILENAMES=/tmp/kbase-test-icd.json`、`DISABLE_WSI_LAYER=1`、`PANVK_KBASE_WSI_SW=1`、`PANVK_KBASE_DEVICE=/dev/mali0`、`PAN_KMOD_RESTRICT_TO_BACKENDS=kbase`、`XDG_RUNTIME_DIR=/tmp`。命令：`vkcube --c N --suppress_popups --width 512 --height 512 --present_mode 2 --wsi xcb`。
+
+M2-A 结论：在 apiVersion 1.0 + 当前 feature 集 + X11 软件呈现下存在可运行的最小应用，**无需退到 B（compute + SSBO）**。
+
+## M2-B compute dispatch + SSBO 最小闭环（2026-10-19）
+
+| 项 | 内容 |
+|---|---|
+| 探针位置 | `mesa-port-backups/m2b-compute-20261019/`：`comp.comp`（GLSL）、`m2b_compute_probe.c`、`comp.spv`、`m2b_compute_probe` |
+| 设计 | 256 个 u32 的 SSBO，初始 `values[i]=i`；`local_size_x=64`、dispatch 4 组；shader 做 `values[i] = values[i]*2 + 1`；提交计算队列，`vkWaitForFences`（5 s 超时）+ `vkQueueWaitIdle` 后 CPU 回读逐项比对 |
+| 判据 | expected = `2*i+1`；observed 逐项比较，`mismatch=0/256` 为 PASS。若 dispatch 未执行，observed 应为 `i`，全部 256 项不匹配，判据可区分 |
+| 结果 | ⭐ **PASS 6/6**（首次 + 5 次重复），全部 `mismatch=0/256`。`OBSERVED first8=1,3,5,7,9,11,13,15` 与 `EXPECTED` 一致 |
+| 环境 | `VK_ICD_FILENAMES=/tmp/kbase-test-icd.json`、`PANVK_KBASE_DEVICE=/dev/mali0`、`PAN_KMOD_RESTRICT_TO_BACKENDS=kbase`；无 surface/swapchain，无 WSI |
+| 设备信息 | `Mali-G925-Immortalis MC12 api=1.0.0`；唯一队列族 `index=0 flags=0x7`（GRAPHICS/COMPUTE/TRANSFER） |
+| 缺口 | 未遇到未声明 feature/扩展；`pEnabledFeatures=NULL`、`enabledExtensionCount=0` 即可建 compute pipeline |
+| 覆盖边界 | 已验证：compute pipeline 创建、STORAGE_BUFFER 描述符绑定、dispatch 执行、SSBO 读改写、host 回读、fence/queue 同步。未验证：device-local SSBO、间接 dispatch、原子/workgroup/subgroup、dispatch 与其他阶段的 GPU 侧屏障、多 dispatch 链；API 失败路径未覆盖 |
+| 日志 | `/tmp/m2b_run1.log`、`/tmp/m2b_rep_1..5.log` |
+
+### vkgears 崩溃记录（只记现象，不深挖）
+
+| 日期 | 现象 | 环境 |
+|---|---|---|
+| 2026-10-19 | `vkgears -size 512x512` 打印 `WARNING: panvk is not a conformant Vulkan implementation, testing use only.` 后**立即 SIGSEGV（rc=139）**，未输出设备/交换链信息 | 与 vkmark/vkcube 相同 kbase 环境（X11 软件呈现、apiVersion 1.0、feature 仅 4 项）；日志 `/tmp/m2a_vkgears.log`。按约定不调查；疑与其所需 feature/扩展在当前声明下为零有关，未验证 |
+
+## M3-A 异步提交重新评估（2026-10-19）
+
+| 场景 | 模式 | 次数 | 通过 | 耗时 | 失败形态 |
+|---|---|---|---|---|---|
+| m2b compute（256×u32 SSBO + dispatch） | sync（变量未设） | 5 | 5/5 | 17–35 ms（中位 ~22） | — |
+| 同上 | async（`PANVK_KBASE_ASYNC_SUBMIT=1`） | 5 | 5/5 | 27–34 ms（中位 ~29） | — |
+| vkcube `--c 60` 512×512 fifo | sync | 5 | 5/5 | 583–632 ms（首跑 288 ms 为离群值） | — |
+| 同上 | async | 5 | 5/5 | 613–673 ms（约 +3%） | — |
+
+- CPU 时间（bash `time`，compute，各 3 次）：sync `real≈0.025 user≈0.004–0.008 sys≈0.011–0.016`；async `real≈0.021–0.025 user≈0.003–0.008 sys≈0.012–0.014`。**无 CPU 等待减少的可测量证据**——微基准总耗时仅 20–30 ms，dispatch 延迟主导，本来就没有可省的等待。
+- vkcube 改为异步后帧时间无改善（约 +3%，在噪声边缘），与之前 "SHM 单帧必须等" 的判断一致。
+- **残余卡死形态**：本轮 20 次运行**未出现** fence 永不就绪，也未出现 `DEVICE_LOST`/超时。若后续出现，形态应为进程挂起直到超时（async 下没有 5 s 的 completion 超时翻译）。
+- ⚠️ **开关语义**：代码是 `getenv("PANVK_KBASE_ASYNC_SUBMIT") != NULL`（`panvk_kbase_compute_queue.inc:623`），**只要变量存在就开异步**，`=0` 不会关闭。本轮 sync 对照用的是 `unset`，不是 `=0`。后续脚本必须用 unset。
+- 结论：**不改默认值**，异步仍 opt-in。没有证据支持在 compute 或 vkcube 场景默认开启。
+- 日志：`/tmp/m3_compute_{sync,async}_1..5.log`、`/tmp/m3_vkcube_{sync,async}_1..5.log`。
+
+## 异步开关语义修复（2026-10-19）
+
+| 项 | 内容 |
+|---|---|
+| 修复 | `PANVK_KBASE_ASYNC_SUBMIT` 改为显式解析：未设或非 `"0"` → 开；`"0"` → 关。位置 `panvk_kbase_compute_queue.inc:623` 及 `<string.h>` |
+| 验证（gdb 断点 `panvk_kbase_sync_set_pending`） | `=0`：**不命中**，进程正常退出（sync 路径）；未设：命中，栈为 `kbase_compute_submit → panvk_kbase_sync_set_pending`（async 路径）；`=false`：命中（非 `"0"` 视为开启） |
+| 默认值 | 未改：不设变量仍为异步（与修复前行为一致） |
+
+## M3-B GL 路径静态评估（2026-10-19，不实施）
+
+| 问题 | 结论 |
+|---|---|
+| `pan_device.c` ENOTSUP 挡的是什么 | `panfrost_open_device()` 在 `pan_kmod_dev_create()` 之后、读 GPU props 之前，若后端是 `kbase_kmod_ops` 直接 `errno=ENOTSUP; goto err`（`pan_device.c:45-50`）。唯一调用者是 `panfrost_create_screen()`（`pan_screen.c:1046`），其入口是由 DRI loader 用 DRM 设备名打开的 `panfrost_drm_screen_create()`（`panfrost_drm_winsys.c:126`、`dri_util.c:1118`）。⇒ **它挡住的是整个 Gallium screen 创建**，不只是某一条特性路径 |
+| 解开前置条件 | ①把 kbase fd 送进 Gallium 的入口（本机无 `renderD*`，loader 找不到设备；需 env/平台入口打开 `/dev/mali0`）；②kbase 提交后端；③kbase 同步后端；④`bo_wait`/`bo_export`；⑤WSI 决策（见下） |
+| DRM 假设 | Gallium CSF 直接用 panthor ioctl：`DRM_IOCTL_PANTHOR_GROUP_SUBMIT`（`pan_csf.c:554-566`）、`GROUP_CREATE`（`:1978`）、`GROUP_GET_STATE`（`:797`）；这些经 `pan_kmod_ioctl` 原样下发，kbase UAPI 完全不同，**不能靠 ifdef 翻译** |
+| mmap / VM | `kbase_kmod_bo_mmap` 可用（WB 映射）；但 `kbase_kmod_bo_wait` 是 ENOTSUP（`kbase_kmod.c:593-598`）、`bo_export` ENOTSUP（`:547-553`）；`vm_bind` 仅支持立即模式（`:1008-1009`），部分 VM op 类型 ENOTSUP（`:1020,:1047`） |
+| 同步 | kbase 的 `util_sync_provider` **全部 ENOTSUP**（`kbase_sync.c`：create/destroy/handle↔fd/import/export/wait/reset/signal/transfer）。Gallium CSF 依赖 `pan_kmod_sync_*` 与 `ctx->syncobj`（`pan_csf.c:751-752,2096,2137`）⇒ 现有 fence/WSI 路径无法工作 |
+| WSI | GL winsys 走 DRM dumb buffer + `drmPrimeHandleToFD` 导出（`panfrost_drm_winsys.c:100-110`）与 renderonly；内核无 dma-buf exporter、无 DRM 节点 ⇒ 只能走软件 SHM 呈现（与 Vulkan `sw_device` 同思路） |
+| 可复用 | panfrost 编译器/NIR、格式与 blend 表、`cs_builder` + `pan_csf.c` 的 CS 生成、`pan_kmod` BO/VM 分配、`kbase_csf` 的 queue/ring/doorbell/wait、kbase heap 续期、panvk 的同步概念 |
+| 必须新写 | kbase winsys/screen 入口与 fd 注入；kbase 提交后端（把 CS 发布到 queue group，替换 panthor group ioctl）；kbase `util_sync_provider` 真实实现；Gallium fence 对接；`bo_wait`；上屏时的 SHM 呈现（或先只做 offscreen） |
+| 工作量粗估 | **Offscreen GL（surfaceless EGL + FBO 绘制 + 回读）**：约 3–5k 行新增/改动，单人+真机约 4–8 周，风险高；**上屏 X11 GL**：再加 2–4k 行、约 2–4 周，风险高且无零拷贝；**完整应用兼容/一致性**不在估算内 |
+| 替代路线 | Zink（GL over Vulkan）：当前 kbase Vulkan 的扩展表几乎全零、feature 仅 4 项，Zink 不可行；若走此路需先做一轮能力声明扩展，属另一项工程 |
+| 最大风险 | Gallium CSF 后端在架构上就是 panthor UAPI 形状；缺的不是几个 ifdef，而是提交与同步两套后端，且 GL state tracker 的正确性要求远高于目前 panvk 已验证子集 |
+| 结论 | 静态可行但代价高；不建议作为近期里程碑，除非 GL 成为硬需求。本评估未写代码、未做动态实验 |
+
+## 一键演示包（2026-10-19）
+
+| 文件 | 作用 |
+|---|---|
+| `mesa-port-backups/demo-20261019/build.sh` | 构建 ICD（ninja + 拷贝）、生成绝对路径 ICD json、编译 compute 探针与 SPIR-V |
+| `env.sh` | 统一环境变量：DISPLAY、XDG_RUNTIME_DIR、VK_ICD_FILENAMES、DISABLE_WSI_LAYER、PANVK_KBASE_WSI_SW、PANVK_KBASE_DEVICE、PAN_KMOD_RESTRICT_TO_BACKENDS |
+| `run.sh` | 一条命令依次跑 vkmark vertex、vkcube 60 帧、compute 探针，逐项 PASS/FAIL + 总耗时，日志 `/tmp/demo_<item>.log` |
+| `compute/` | `comp.comp`、`m2b_compute_probe.c`（SSBO 读改写 + 精确回读） |
+| `KNOWN-LIMITATIONS.md` | WSI/扩展/异步/同步缓解/TILER_OOM/GL 等已知限制 |
+| `PROJECT-STATUS.md` | 定位、能力清单、三条路线成本收益 |
+
+已验证：`build.sh` 在真机环境成功产出 ICD、SPIR-V 与探针可执行文件。
+
+## 长时稳定性（2026-10-19）
+
+| 测试 | 结果 | 失败形态 |
+|---|---|---|
+| vkcube 10 分钟（`--c 100000000`, 512×512 fifo） | **失败，约 540 s 崩溃** | SIGABRT：`vkcube: ./cube/cube.c:1327: demo_draw: Assertion '!err' failed`；窗口在 60 s 存在、540 s 消失；vkcube 不打印具体 Vulkan 错误值 |
+| compute 探针 1000 次 | **1000/1000 通过**（26 s，`mismatch=0/256`） | 无 |
+| vkmark vertex 100 轮 | **99/100 通过**；FPS min 229 / max 334 / mean 290 | run 67：`kbase completion failed (VK_ERROR_DEVICE_LOST)` → `vk::DeviceLostError`（已知残余同步卡死） |
+
+⭐ **init 16 工程缓解下残余卡死复现**：vkmark 100 轮中 1 次（约 1%）。按此前决策规则，这满足“init 16 下再次复现”的重新追根因条件；本轮按任务边界未调查，留待决定。
+
+演示包验证：`demo-20261019/run.sh` 一条命令 3/3 通过（vkmark 2081 ms、vkcube 719 ms、compute 27 ms，总 2841 ms）。包内 `lib/` 与构建产物、`/tmp/kbase-icd` 三处二进制 `cmp` 一致。
+
+## vkcube 长时崩溃取证与 vkmark 1% 处置（2026-10-19）
+
+| 项 | 内容 |
+|---|---|
+| 取证方式 | 本地构建 Vulkan-Tools `vulkan-sdk-1.4.304.1`（`/tmp/vt-src-304`），只在 `demo_draw` 的 present `else` 分支断言前加一行错误码打印（`VKCUBE_PRESENT_ERROR`），不改驱动 |
+| 构建 | `cmake -DUPDATE_DEPS=ON -DBUILD_CUBE=ON -DBUILD_WSI_XLIB_SUPPORT=ON -DBUILD_WSI_XCB_SUPPORT=ON`，产物 `/tmp/vt-src-304/build/cube/vkcube`；60 帧 sanity rc=0 |
+| 10 分钟结果 | **未复现崩溃**：`rc=124`（timeout 到点仍在运行）、窗口在 60 s 与 540 s 均存在、日志无 `VKCUBE_PRESENT_ERROR` |
+| 结论 | 分发版 vkcube 的一次 ~540 s SIGABRT（`demo_draw` 断言 `!err`）为**非确定性、未复现、错误码未知**；patched 本地版单次 10 分钟通过不足以断言已消失。按指示记录后停，不深挖 |
+| vkmark 1% | 已在 `KNOWN-LIMITATIONS.md` 标注 **“known, accepted, not pursued”**；不再调查 |
+| 边界 | 未改驱动核心代码；未碰 WSI/U7/级 C；未动 `panvk_kbase_sync_type` 与 5 处 heap 跳过 |
