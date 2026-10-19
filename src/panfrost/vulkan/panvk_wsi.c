@@ -54,13 +54,13 @@ panvk_wsi_init(struct panvk_physical_device *physical_device)
                             panvk_wsi_proc_addr, &instance->vk.alloc, -1,
                             &instance->drirc.options,
                             &(struct wsi_device_options){
-                               /* kbase has no dma-buf exporter, so the WSI
-                                * backend cannot hand images to the compositor
-                                * that way. The software path skips
-                                * GetMemoryFdKHR entirely and copies through
-                                * host memory instead. Opt-in until the path
-                                * has been exercised on hardware. */
-                               .sw_device = getenv("PANVK_KBASE_WSI_SW") != NULL,
+                               /* Software presentation is opt-in via
+                                * PANVK_KBASE_WSI_SW.  PANVK_KBASE_WSI_NATIVE
+                                * selects the native X11/DRI3 path instead,
+                                * which relies on the dma-heap export path. */
+                               .sw_device =
+                                  getenv("PANVK_KBASE_WSI_SW") != NULL &&
+                                  getenv("PANVK_KBASE_WSI_NATIVE") == NULL,
                             });
    if (result != VK_SUCCESS)
       return result;
@@ -71,7 +71,10 @@ panvk_wsi_init(struct panvk_physical_device *physical_device)
    physical_device->wsi_device.disable_unordered_submits =
       panvk_physical_device_uses_kbase(physical_device);
 
-   physical_device->wsi_device.supports_modifiers = true;
+   /* Native kbase WSI uses linear dma-bufs until DRM format modifiers are
+    * verified; modifiers would require VK_EXT_image_drm_format_modifier. */
+   physical_device->wsi_device.supports_modifiers =
+      !panvk_physical_device_uses_kbase(physical_device);
    physical_device->wsi_device.can_present_on_device =
       panvk_can_present_on_device;
 

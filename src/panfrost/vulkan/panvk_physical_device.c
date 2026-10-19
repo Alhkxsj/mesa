@@ -492,7 +492,8 @@ physical_device_init(struct panvk_physical_device *device,
    /* The physical-device WSI entry points are needed whenever a surface can
     * exist at all, which for kbase means the software presentation path. */
    if (!panvk_physical_device_uses_kbase(device) ||
-       getenv("PANVK_KBASE_WSI_SW") != NULL)
+       getenv("PANVK_KBASE_WSI_SW") != NULL ||
+       getenv("PANVK_KBASE_WSI_NATIVE") != NULL)
       vk_physical_device_dispatch_table_from_entrypoints(
          &dispatch_table, &wsi_physical_device_entrypoints, false);
 
@@ -516,7 +517,8 @@ physical_device_init(struct panvk_physical_device *device,
     * With the software presentation path enabled it can still work, so allow
     * opting in while the path is being verified. */
    if (!panvk_physical_device_uses_kbase(device) ||
-       getenv("PANVK_KBASE_WSI_SW") != NULL) {
+       getenv("PANVK_KBASE_WSI_SW") != NULL ||
+       getenv("PANVK_KBASE_WSI_NATIVE") != NULL) {
       result = panvk_wsi_init(device);
       if (result != VK_SUCCESS)
          goto fail;

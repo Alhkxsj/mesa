@@ -121,7 +121,8 @@ panvk_kbase_physical_device_capabilities(struct vk_device_extension_table *exten
       /* Only the swapchain extension WSI actually needs, and only while the
        * software presentation path is being verified: kbase cannot export
        * dma-buf, so a real swapchain is out of reach for now. */
-      if (getenv("PANVK_KBASE_WSI_SW") != NULL)
+      if (getenv("PANVK_KBASE_WSI_SW") != NULL ||
+          getenv("PANVK_KBASE_WSI_NATIVE") != NULL)
          extensions->KHR_swapchain = true;
 
       /* Verification-only candidates. Never set PANVK_KBASE_EXPERIMENT in a
