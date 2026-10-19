@@ -215,17 +215,29 @@ panvk_kbase_physical_device_capabilities(struct vk_device_extension_table *exten
       features->separateDepthStencilLayouts = api12;
       features->drawIndirectCount = api12;
 
-      features->descriptorIndexing = false;
-      features->runtimeDescriptorArray = false;
+      /* Only the runtime-array verification set is exposed: the parent
+       * descriptorIndexing feature plus its runtimeDescriptorArray and
+       * descriptorBindingVariableDescriptorCount children.  Everything else
+       * stays off until it is verified on hardware. */
+      features->descriptorIndexing =
+         api12 && (kbase_experiment("runtimeDescriptorArray") ||
+                   kbase_experiment("descriptorBindingVariableDescriptorCount") ||
+                   kbase_experiment("descriptorBindingPartiallyBound") ||
+                   kbase_experiment("descriptorBindingStorageBufferUpdateAfterBind"));
+      features->runtimeDescriptorArray =
+         api12 && kbase_experiment("runtimeDescriptorArray");
       features->descriptorBindingUniformBufferUpdateAfterBind = false;
       features->descriptorBindingSampledImageUpdateAfterBind = false;
       features->descriptorBindingStorageImageUpdateAfterBind = false;
-      features->descriptorBindingStorageBufferUpdateAfterBind = false;
+      features->descriptorBindingStorageBufferUpdateAfterBind =
+         api12 && kbase_experiment("descriptorBindingStorageBufferUpdateAfterBind");
       features->descriptorBindingUniformTexelBufferUpdateAfterBind = false;
       features->descriptorBindingStorageTexelBufferUpdateAfterBind = false;
       features->descriptorBindingUpdateUnusedWhilePending = false;
-      features->descriptorBindingPartiallyBound = false;
-      features->descriptorBindingVariableDescriptorCount = false;
+      features->descriptorBindingPartiallyBound =
+         api12 && kbase_experiment("descriptorBindingPartiallyBound");
+      features->descriptorBindingVariableDescriptorCount =
+         api12 && kbase_experiment("descriptorBindingVariableDescriptorCount");
       features->bufferDeviceAddress = false;
       features->vulkanMemoryModel = false;
       features->vulkanMemoryModelDeviceScope = false;
