@@ -1265,6 +1265,7 @@ struct x11_swapchain {
    bool                                         has_mit_shm;
    bool                                         has_async_may_tear;
    bool                                         msc_estimate_is_stable;
+   bool                                         no_present_idle_fence;
 
    xcb_connection_t *                           conn;
    xcb_window_t                                 window;
@@ -1849,7 +1850,8 @@ x11_present_to_x11_dri3(struct x11_swapchain *chain, uint32_t image_index,
                                   0,                  /* y_off */
                                   XCB_NONE,           /* target_crtc */
                                   XCB_NONE,
-                                  image->sync_fence,
+                                  chain->no_present_idle_fence ?
+                                     XCB_NONE : image->sync_fence,
                                   options,
                                   target_msc,
                                   divisor,
@@ -2213,7 +2215,8 @@ x11_acquire_next_image(struct wsi_swapchain *wsi_chain,
    assert(*image_index < chain->base.image_count);
 #ifdef HAVE_X11_DRM
    if (chain->images[*image_index].shm_fence &&
-       !chain->base.image_info.explicit_sync)
+       !chain->base.image_info.explicit_sync &&
+       !chain->no_present_idle_fence)
       xshmfence_await(chain->images[*image_index].shm_fence);
 #endif
 
@@ -2775,6 +2778,12 @@ out_fence:
                           false,
                           fence_fd);
 
+   /* Termux:X11's X server mis-associates FDs when the FenceFromFD fd and the
+    * next image's PixmapFromBuffer fd are delivered in a single sendmsg batch,
+    * which makes the second PixmapFromBuffer fail with BadValue.  Flush so
+    * every fd-carrying request is written out on its own. */
+   xcb_flush(chain->conn);
+
    xshmfence_trigger(image->shm_fence);
    return VK_SUCCESS;
 
@@ -3294,6 +3303,11 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    chain->has_mit_shm = wsi_conn->has_mit_shm;
    chain->has_async_may_tear = present_caps & XCB_PRESENT_CAPABILITY_ASYNC_MAY_TEAR;
    chain->has_reliable_msc = !wsi_conn->is_xwayland;
+   /* Termux:X11 stops delivering Present events entirely when PresentPixmap
+    * carries a DRI3 idle fence, which leaves images stuck in the present
+    * queue.  Opt in to passing no idle fence to that server. */
+   chain->no_present_idle_fence =
+      getenv("MESA_X11_NO_PRESENT_IDLE_FENCE") != NULL;
 
    /* When images in the swapchain don't fit the window, X can still present them, but it won't
     * happen by flip, only by copy. So this is a suboptimal copy, because if the client would change
