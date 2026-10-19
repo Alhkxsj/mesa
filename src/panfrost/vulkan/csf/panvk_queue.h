@@ -101,6 +101,7 @@ struct panvk_gpu_queue {
       struct kbase_kmod_heap *heap;
       struct kbase_kmod_heap *retired_heap;
       struct kbase_kmod_alias *desc_alias;
+      uint32_t tiler_submit_count;
       bool graphics_ready;
    } kbase;
 #endif

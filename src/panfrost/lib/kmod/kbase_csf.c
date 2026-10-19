@@ -86,6 +86,12 @@ csf_ioctl(struct kbase_csf_context *ctx, unsigned long request, void *arg)
    return ioctl(ctx->dev->fd, request, arg);
 }
 
+int
+kbase_csf_event_signal(struct kbase_csf_context *ctx)
+{
+   return csf_ioctl(ctx, KBASE_IOCTL_CS_EVENT_SIGNAL, NULL);
+}
+
 static void
 context_destroy(struct kbase_csf_context *ctx)
 {
@@ -597,6 +603,15 @@ kbase_csf_queue_seqno_va(struct kbase_csf_queue *queue)
    return queue ? queue->seqno_va : 0;
 }
 
+/* Read-only view of the seqno cell, for diagnostics only.  The caller must
+ * not use this instead of kbase_csf_wait(): reading without the cache sync
+ * the wait loop performs can observe a stale value. */
+const void *
+kbase_csf_queue_seqno_map(struct kbase_csf_queue *queue)
+{
+   return queue ? queue->seqno_map : NULL;
+}
+
 uint64_t
 kbase_csf_queue_published_target(struct kbase_csf_queue *queue)
 {
@@ -606,6 +621,54 @@ kbase_csf_queue_published_target(struct kbase_csf_queue *queue)
    uint64_t target = queue->published_target;
    mtx_unlock(&queue->ctx->lock);
    return target;
+}
+
+/* Firmware progress counters, for diagnostics only.  CS_EXTRACT reports how
+ * far the firmware has fetched the ring; CS_ACTIVE tells whether the queue is
+ * currently scheduled.  Both are read without the surrounding cache sync the
+ * wait loop performs, so a diagnostic must not draw completion conclusions
+ * from them. */
+uint64_t
+kbase_csf_queue_extract(struct kbase_csf_queue *queue)
+{
+   return queue && queue->extract ? *queue->extract : 0;
+}
+
+uint32_t
+kbase_csf_queue_active(struct kbase_csf_queue *queue)
+{
+   if (!queue || !queue->user_io)
+      return 0;
+   return *(volatile uint32_t *)((uint8_t *)queue->user_io +
+                                 2 * CSF_PAGE_SIZE +
+                                 CS_USER_IO_OUTPUT_CS_ACTIVE);
+}
+
+uint64_t
+kbase_csf_queue_published_insert(struct kbase_csf_queue *queue)
+{
+   if (!queue)
+      return 0;
+   mtx_lock(&queue->ctx->lock);
+   uint64_t insert = queue->published_insert;
+   mtx_unlock(&queue->ctx->lock);
+   return insert;
+}
+
+uint64_t
+kbase_csf_queue_ring_va(struct kbase_csf_queue *queue)
+{
+   return queue ? queue->ring_va : 0;
+}
+
+const void *
+kbase_csf_queue_ring_map(struct kbase_csf_queue *queue, uint64_t *size)
+{
+   if (!queue || !queue->ring_map || !queue->ring)
+      return NULL;
+   if (size)
+      *size = queue->ring->size;
+   return queue->ring_map;
 }
 
 static int
@@ -690,6 +753,42 @@ kbase_csf_queue_prepare(struct kbase_csf_queue *queue, const void *commands,
    return ret;
 }
 
+static inline void
+gpu_wmb(void)
+{
+#if defined(__aarch64__)
+   /* The GPU is in the outer shareable domain, so the inner-shareable DMB
+    * that __sync_synchronize() emits does not order the ring writes against
+    * the firmware's read of them: they can still sit in the CPU write-combine
+    * buffer when the firmware fetches the ring.  DSB SY drains them. */
+   __asm__ volatile("dsb sy" ::: "memory");
+#else
+   __sync_synchronize();
+#endif
+}
+
+#define CACHELINE_SIZE 64
+
+/* Bring a range written by the GPU into the CPU's view without an ioctl.
+ * The wait loop polls this once per slice, so routing it through
+ * KBASE_IOCTL_MEM_SYNC would contend with the scheduler on the same fd. */
+static inline void
+cache_invalidate_range(const void *start, size_t size)
+{
+#if defined(__aarch64__)
+   uintptr_t ptr = (uintptr_t)start & ~(uintptr_t)(CACHELINE_SIZE - 1);
+   uintptr_t end = ((uintptr_t)start + size + CACHELINE_SIZE - 1) &
+                   ~(uintptr_t)(CACHELINE_SIZE - 1);
+
+   for (; ptr < end; ptr += CACHELINE_SIZE)
+      __asm__ volatile("dc civac, %0" : : "r"(ptr) : "memory");
+#else
+   (void)start;
+   (void)size;
+#endif
+   gpu_wmb();
+}
+
 static int
 publish_locked(struct kbase_csf_context *ctx,
                struct kbase_csf_queue *const *queues, uint32_t count,
@@ -714,17 +813,33 @@ publish_locked(struct kbase_csf_context *ctx,
    }
 
    atomic_thread_fence(memory_order_seq_cst);
-   __sync_synchronize();
+   gpu_wmb();
    for (uint32_t i = 0; i < count; i++) {
-      *queues[i]->insert = queues[i]->prepared_insert;
-      queues[i]->published_insert = queues[i]->prepared_insert;
-      queues[i]->published_target = queues[i]->prepared_target;
+      struct kbase_csf_queue *q = queues[i];
+      *q->insert = q->prepared_insert;
+      q->published_insert = q->prepared_insert;
+      q->published_target = q->prepared_target;
    }
    *inserted = true;
-   __sync_synchronize();
+   gpu_wmb();
+
+   /* An active queue consumes a userspace doorbell without an ioctl.  Re-read
+    * CS_ACTIVE after ringing it because a suspend can race the write; the
+    * scheduler kick below safely resumes the group in that case.  Skipping
+    * the ioctl when the doorbell was consumed keeps the hot path cheap. */
    for (uint32_t i = 0; i < count; i++) {
+      struct kbase_csf_queue *q = queues[i];
+      volatile uint32_t *active =
+         (volatile uint32_t *)((uint8_t *)q->user_io + 2 * CSF_PAGE_SIZE +
+                               CS_USER_IO_OUTPUT_CS_ACTIVE);
+      if (*active) {
+         *(volatile uint32_t *)q->user_io = 1;
+         gpu_wmb();
+         if (*active)
+            continue;
+      }
       struct kbase_ioctl_cs_queue_kick kick = {
-         .buffer_gpu_addr = queues[i]->ring_va,
+         .buffer_gpu_addr = q->ring_va,
       };
       if (ioctl(ctx->dev->fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick)) {
          int error = errno;
@@ -910,6 +1025,14 @@ kbase_csf_wait(struct kbase_csf_queue *const *queues, uint32_t count,
       }
    }
 
+   uint64_t last_kick = monotonic_ns();
+   uint64_t last_seen[CSF_MAX_PUBLISH] = {0};
+   uint64_t rekick_ns = 500000000ull;
+   const char *rk = getenv("PANVK_KBASE_TEST_REKICK_MS");
+   if (rk && *rk) {
+      long long ms = strtoll(rk, NULL, 0);
+      rekick_ns = ms <= 0 ? UINT64_MAX : (uint64_t)ms * 1000000ull;
+   }
    for (;;) {
       if (ctx_is_lost(ctx)) {
          errno = atomic_load_explicit(&ctx->cancelled, memory_order_acquire) ?
@@ -944,11 +1067,7 @@ kbase_csf_wait(struct kbase_csf_queue *const *queues, uint32_t count,
             mtx_unlock(&ctx->lock);
             return -1;
          }
-         if (kbase_kmod_bo_sync(q->seqno, 0, CSF_SEQNO_SIZE,
-                                PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE)) {
-            mtx_unlock(&ctx->lock);
-            return -1;
-         }
+         cache_invalidate_range(q->seqno_map, CSF_SEQNO_SIZE);
          uint64_t seqno = *(volatile uint64_t *)q->seqno_map;
          uint32_t error = *(volatile uint32_t *)((uint8_t *)q->seqno_map + 8);
          if (error) {
@@ -959,6 +1078,7 @@ kbase_csf_wait(struct kbase_csf_queue *const *queues, uint32_t count,
          }
          if (seqno < targets[i])
             complete = false;
+         last_seen[i] = seqno;
       }
       mtx_unlock(&ctx->lock);
       if (ctx_is_lost(ctx)) {
@@ -972,6 +1092,33 @@ kbase_csf_wait(struct kbase_csf_queue *const *queues, uint32_t count,
       if (!now) {
          errno = EIO;
          return -1;
+      }
+      /* Re-kick periodically.  A kick can race with an in-flight group
+       * suspend and get dropped, and the queue then sits with published work
+       * the firmware never resumes.  Only the queues still short of their
+       * target are re-kicked; re-kicking a queue that already retired would
+       * inject an unrelated scheduler event into its stream. */
+      if (now - last_kick >= rekick_ns) {
+         if (kbase_csf_event_signal(ctx)) {
+            int error = errno;
+            ctx_mark_lost(ctx);
+            errno = error;
+            return -1;
+         }
+         for (uint32_t i = 0; i < count; i++) {
+            if (!targets[i] || targets[i] <= last_seen[i])
+               continue;
+            struct kbase_ioctl_cs_queue_kick kick = {
+               .buffer_gpu_addr = queues[i]->ring_va,
+            };
+            if (ioctl(ctx->dev->fd, KBASE_IOCTL_CS_QUEUE_KICK, &kick)) {
+               int error = errno;
+               ctx_mark_lost(ctx);
+               errno = error;
+               return -1;
+            }
+         }
+         last_kick = now;
       }
       if (now >= abs_timeout_ns)
          return 0;

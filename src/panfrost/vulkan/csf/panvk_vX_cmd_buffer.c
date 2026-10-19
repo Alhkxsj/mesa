@@ -226,7 +226,8 @@ finish_queries(struct panvk_cmd_buffer *cmdbuf)
                    offsetof(struct panvk_cs_timestamp_query, avail));
 
       cs_move32_to(b, signal_val, 1);
-      cs_sync32_set(b, true, MALI_CS_SYNC_SCOPE_CSG, signal_val, syncobj,
+      cs_sync32_set(b, true, panvk_cs_signal_scope(cmdbuf), signal_val,
+                    syncobj,
                     cs_defer(SB_IMM_MASK, SB_ID(DEFERRED_SYNC)));
    }
 

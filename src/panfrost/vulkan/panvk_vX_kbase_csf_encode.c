@@ -56,7 +56,6 @@ panvk_kbase_csf_encode(const struct panvk_kbase_csf_encode_info *info,
        info->deferred_slot == info->ls_slot ||
        info->deferred_slot == info->flush_slot ||
        info->deferred_slot == info->iterator_slot ||
-       info->flush_slot == info->ls_slot ||
        info->iterator_slot == info->ls_slot ||
        info->iterator_slot == info->flush_slot ||
        !info->iterator_mask ||

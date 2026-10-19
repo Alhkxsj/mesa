@@ -1,12 +1,16 @@
 #if defined(HAVE_PAN_KMOD_KBASE)
 
 #include <poll.h>
+#include <string.h>
 
 struct kbase_compute_entry {
    uint64_t commands[128];
    uint32_t size;
    uint32_t subqueue;
    uint64_t target;
+   uint64_t stream;
+   uint32_t stream_size;
+   const uint64_t *stream_cpu;
 };
 
 static bool
@@ -21,7 +25,7 @@ kbase_compute_encode(struct panvk_gpu_queue *queue, uint32_t subqueue,
       .unpreserved_count = csif->unpreserved_cs_reg_count,
       .scoreboard_count = dev->csf.sb.count,
       .ls_slot = SB_ID(LS),
-      .flush_slot = SB_ID(DEFERRED_FLUSH),
+      .flush_slot = SB_ID(IMM_FLUSH),
       .deferred_slot = SB_ID(DEFERRED_SYNC),
       .iterator_slot = SB_ITER(0),
       .iterator_mask = dev->csf.sb.all_iters_mask,
@@ -63,13 +67,16 @@ kbase_compute_encode(struct panvk_gpu_queue *queue, uint32_t subqueue,
       info.probe_value = 0x1122334455667788ull;
    }
    entry->subqueue = subqueue;
+   entry->stream = stream;
+   entry->stream_size = stream_size;
    return panvk_per_arch(kbase_csf_encode)(&info, entry->commands,
                                            sizeof(entry->commands), &entry->size);
 }
 
 static VkResult
 kbase_compute_execute(struct panvk_gpu_queue *queue,
-                        const struct kbase_compute_entry *entries, uint32_t count)
+                        const struct kbase_compute_entry *entries, uint32_t count,
+                        bool wait_for_completion)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct kbase_csf_submit_entry submit[PANVK_SUBQUEUE_COUNT];
@@ -123,15 +130,134 @@ kbase_compute_execute(struct panvk_gpu_queue *queue,
       }
    }
 
-   if (kbase_csf_submit(submit, count)) {
-      if (kcpu_probe)
-         kbase_csf_kcpu_destroy(kcpu_probe);
-      return vk_queue_set_lost(&queue->vk, "kbase submission failed");
+   while (kbase_csf_submit(submit, count)) {
+      /* The userspace ring is smaller than the amount of work an
+       * asynchronous submit can leave queued, so drain the queue's current
+       * target and retry instead of failing the submission. */
+      if (errno != EAGAIN) {
+         if (kcpu_probe)
+            kbase_csf_kcpu_destroy(kcpu_probe);
+         return vk_queue_set_lost(&queue->vk, "kbase submission failed");
+      }
+      uint64_t pending[PANVK_SUBQUEUE_COUNT];
+      bool any = false;
+      for (uint32_t i = 0; i < count; i++) {
+         pending[i] = queue->kbase.targets[entries[i].subqueue];
+         any |= pending[i] != 0;
+      }
+      if (!any ||
+          kbase_csf_wait(queues, count, pending,
+                         os_time_get_nano() + 5000000000ull) != 1) {
+         if (kcpu_probe)
+            kbase_csf_kcpu_destroy(kcpu_probe);
+         return vk_queue_set_lost(&queue->vk, "kbase ring reclaim failed");
+      }
    }
    for (uint32_t i = 0; i < count; i++)
       queue->kbase.targets[entries[i].subqueue] = targets[i];
-   uint64_t deadline = os_time_get_nano() + 5000000000ull;
-   if (kbase_csf_wait(queues, count, targets, deadline) != 1) {
+   if (!wait_for_completion)
+      return VK_SUCCESS;
+   uint64_t wait_ns = 5000000000ull;
+   const char *wt = getenv("PANVK_KBASE_TEST_WAIT_NS");
+   if (wt && *wt) {
+      long long v = strtoll(wt, NULL, 0);
+      if (v > 0)
+         wait_ns = (uint64_t)v;
+   }
+   uint64_t deadline = os_time_get_nano() + wait_ns;
+   int waited = kbase_csf_wait(queues, count, targets, deadline);
+   if (waited != 1) {
+      if (getenv("PANVK_KBASE_TEST_SYNCOBJS")) {
+         /* Temporary diagnostic: the subqueue sync cells are written by the
+          * GPU, so invalidate before reading.  Default off. */
+         panvk_priv_mem_invalidate(
+            queue->syncobjs, 0, 64);
+         pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+         const uint8_t *cells = panvk_priv_mem_host_addr(queue->syncobjs);
+         uint64_t wanted[PANVK_SUBQUEUE_COUNT] = {0};
+         for (uint32_t i = 0; i < count; i++)
+            wanted[entries[i].subqueue] = targets[i];
+         if (!cells) {
+            fprintf(stderr, "KBASE_TEST_SYNCOBJS cpu_ptr=null\n");
+         } else {
+            uint64_t cell[PANVK_SUBQUEUE_COUNT] = {0};
+            for (unsigned k = 0; k < PANVK_SUBQUEUE_COUNT; k++)
+               memcpy(&cell[k],
+                      cells + k * sizeof(struct panvk_cs_sync64),
+                      sizeof(uint64_t));
+            fprintf(stderr,
+                    "KBASE_TEST_SYNCOBJS cell0=%" PRIu64 " cell1=%" PRIu64
+                    " cell2=%" PRIu64 " vt_target=%" PRIu64
+                    " frag_target=%" PRIu64 " compute_target=%" PRIu64 "\n",
+                    cell[0], cell[1], cell[2], wanted[0], wanted[1],
+                    wanted[2]);
+         }
+         fflush(stderr);
+      }
+      if (getenv("PANVK_KBASE_TEST_WAIT_TRACE")) {
+         int wait_errno = errno;
+         fprintf(stderr, "KBASE_TEST_WAIT_RESULT ret=%d errno=%d (%s)\n",
+                 waited, wait_errno, strerror(wait_errno));
+         uint32_t subqueues = 0;
+         uint64_t wanted[PANVK_SUBQUEUE_COUNT] = {0};
+         for (uint32_t i = 0; i < count; i++) {
+            subqueues |= BITFIELD_BIT(entries[i].subqueue);
+            wanted[entries[i].subqueue] = targets[i];
+         }
+         fprintf(stderr,
+                 "KBASE_TEST_WAIT first=%u count=%u subqueues=0x%x "
+                 "vt_target=%" PRIu64 " frag_target=%" PRIu64
+                 " vt_current=%" PRIu64 " frag_current=%" PRIu64 "\n",
+                 entries[0].subqueue, count, subqueues, wanted[0], wanted[1],
+                 queue->kbase.targets[0], queue->kbase.targets[1]);
+         for (uint32_t i = 0; i < count; i++) {
+            struct kbase_csf_queue *q = queues[i];
+            const uint64_t *map = kbase_csf_queue_seqno_map(q);
+            fprintf(stderr,
+                    "KBASE_TEST_QUEUE idx=%u subqueue=%u target=%" PRIu64
+                    " seqno_va=0x%" PRIx64 " published=%" PRIu64
+                    " seqno_now=%" PRIu64 " err=%u"
+                    " insert=%" PRIu64 " extract=%" PRIu64 " active=%u\n",
+                    i, entries[i].subqueue, targets[i],
+                    kbase_csf_queue_seqno_va(q),
+                    kbase_csf_queue_published_target(q),
+                    map ? map[0] : 0,
+                    map ? *(uint32_t *)((uint8_t *)map + 8) : 0,
+                    kbase_csf_queue_published_insert(q),
+                    kbase_csf_queue_extract(q), kbase_csf_queue_active(q));
+            if (entries[i].stream_cpu && entries[i].stream_size) {
+               uint64_t words = entries[i].stream_size / 8;
+               if (words > 96)
+                  words = 96;
+               fprintf(stderr, "KBASE_TEST_STREAM idx=%u words=%" PRIu64 "\n",
+                       i, words);
+               for (uint64_t w = 0; w < words; w += 8) {
+                  fprintf(stderr, "  +%03" PRIu64 ":", w * 8);
+                  for (uint64_t k = 0; k < 8 && w + k < words; k++)
+                     fprintf(stderr, " %016" PRIx64, entries[i].stream_cpu[w + k]);
+                  fprintf(stderr, "\n");
+               }
+            }
+            uint64_t ring_size = 0;
+            const uint8_t *ring = kbase_csf_queue_ring_map(q, &ring_size);
+            if (ring && ring_size) {
+               uint64_t at = kbase_csf_queue_extract(q);
+               for (uint32_t c = 0; c < 5; c++) {
+                  uint64_t line = (at - 128 + c * 64) & (ring_size - 1);
+                  fprintf(stderr, "KBASE_TEST_RING idx=%u off=%" PRIu64
+                                  " (extract=%" PRIu64 "):", i, line, at);
+                  for (uint32_t w = 0; w < 8; w++) {
+                     uint64_t off = (line + w * 8) & (ring_size - 1);
+                     uint64_t val;
+                     memcpy(&val, ring + off, sizeof(val));
+                     fprintf(stderr, " %016" PRIx64, val);
+                  }
+                  fprintf(stderr, "\n");
+               }
+            }
+         }
+         fflush(stderr);
+      }
       if (kcpu_probe)
          kbase_csf_kcpu_destroy(kcpu_probe);
       return vk_queue_set_lost(&queue->vk, "kbase completion failed");
@@ -335,7 +461,7 @@ kbase_compute_init(struct panvk_gpu_queue *queue)
    for (unsigned i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       panvk_priv_mem_write(queue->syncobjs, i * sizeof(struct panvk_cs_sync64),
                            struct panvk_cs_sync64, cell) {
-         *cell = (struct panvk_cs_sync64){.seqno = 1};
+         *cell = (struct panvk_cs_sync64){.seqno = 16};
       }
    }
    result = panvk_priv_bo_create(dev, 4096 * (PANVK_SUBQUEUE_COUNT + 1),
@@ -404,7 +530,8 @@ kbase_compute_init(struct panvk_gpu_queue *queue)
    panvk_priv_bo_flush(queue->kbase.init_stream, PANVK_SUBQUEUE_COUNT * 4096,
                         sizeof(uint64_t));
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
-   return kbase_compute_execute(queue, init_entries, PANVK_SUBQUEUE_COUNT);
+   return kbase_compute_execute(queue, init_entries, PANVK_SUBQUEUE_COUNT,
+                                true);
 }
 
 /* First-frame readiness report.
@@ -452,10 +579,50 @@ kbase_first_frame_probe(struct panvk_gpu_queue *queue,
    return report;
 }
 
+/* Completion object for an asynchronous submission: the signal is not
+ * satisfied by the CPU, only by the GPU seqnos the submit published. */
+static VkResult
+kbase_completion_wait(void *data, uint32_t target_count,
+                      const uint64_t *targets, uint64_t abs_timeout_ns)
+{
+   struct panvk_gpu_queue *queue = data;
+   struct kbase_csf_queue *queues[PANVK_SUBQUEUE_COUNT];
+   if (target_count > PANVK_SUBQUEUE_COUNT)
+      return VK_ERROR_UNKNOWN;
+   for (uint32_t i = 0; i < target_count; i++)
+      queues[i] = queue->kbase.queues[i];
+   int waited = kbase_csf_wait(queues, target_count, targets, abs_timeout_ns);
+   if (waited == 1)
+      return VK_SUCCESS;
+   /* The sync layer hands out short absolute slices and retries, so an
+    * expired slice is a timeout rather than a lost device. */
+   if (waited == 0)
+      return VK_TIMEOUT;
+   return vk_queue_set_lost(&queue->vk, "kbase completion failed");
+}
+
+static void
+kbase_completion_retain(void *data)
+{
+}
+
+static void
+kbase_completion_release(void *data)
+{
+}
+
+static const struct panvk_kbase_completion_ops kbase_completion_ops = {
+   .wait = kbase_completion_wait,
+   .retain = kbase_completion_retain,
+   .release = kbase_completion_release,
+};
+
 static VkResult
 kbase_compute_submit(struct panvk_gpu_queue *queue, struct vk_queue_submit *submit)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   const char *async_env = getenv("PANVK_KBASE_ASYNC_SUBMIT");
+   const bool async_submit = async_env == NULL || strcmp(async_env, "0") != 0;
    if (PANVK_DEBUG(FIRST_FRAME)) {
       struct kbase_first_frame_report r = kbase_first_frame_probe(queue, submit);
       fprintf(stderr,
@@ -501,8 +668,25 @@ kbase_compute_submit(struct panvk_gpu_queue *queue, struct vk_queue_submit *subm
    }
    if (graphics && !queue->kbase.graphics_ready)
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   struct kbase_kmod_heap *replacement = NULL;
+   /* The fragment stream carries no FRAGMENT_COMPLETED heap op on kbase, so
+    * the heap only grows between renewals.  Renewing on every frame keeps
+    * the accounting trivial, but the replacement races the previous heap
+    * generation still in flight often enough to strand the fragment seqno;
+    * amortize renewal over several submissions the way the reference
+    * implementation does. */
+   bool renew_heap = false;
    if (graphics) {
+      static uint32_t renew_interval;
+      if (!renew_interval) {
+         const char *iv = getenv("PANVK_KBASE_TEST_HEAP_INTERVAL");
+         long v = (iv && *iv) ? strtol(iv, NULL, 0) : 128;
+         renew_interval = (v > 0 && v <= UINT32_MAX) ? (uint32_t)v : 1;
+      }
+      queue->kbase.tiler_submit_count++;
+      renew_heap = queue->kbase.tiler_submit_count >= renew_interval;
+   }
+   struct kbase_kmod_heap *replacement = NULL;
+   if (renew_heap) {
       replacement = kbase_graphics_heap_create(queue);
       if (!replacement) {
          if (PANVK_DEBUG(FIRST_FRAME))
@@ -510,6 +694,7 @@ kbase_compute_submit(struct panvk_gpu_queue *queue, struct vk_queue_submit *subm
                     errno, strerror(errno));
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
       }
+      queue->kbase.tiler_submit_count = 0;
    }
    uint32_t wave_count = submit->command_buffer_count;
    struct kbase_compute_entry *entries = wave_count ?
@@ -524,10 +709,10 @@ kbase_compute_submit(struct panvk_gpu_queue *queue, struct vk_queue_submit *subm
    struct kbase_compute_entry rearm[2];
    uint64_t planned[PANVK_SUBQUEUE_COUNT];
    memcpy(planned, queue->kbase.targets, sizeof(planned));
-   uint64_t heap = graphics ? kbase_kmod_heap_context(replacement) :
-                              queue->tiler_heap.context.dev_addr;
+   uint64_t heap = renew_heap ? kbase_kmod_heap_context(replacement) :
+                                kbase_kmod_heap_context(queue->kbase.heap);
    VkResult result = VK_SUCCESS;
-   if (graphics) {
+   if (renew_heap) {
       for (unsigned j = 0; j < 2; j++) {
          if (planned[j] == UINT64_MAX) {
             result = VK_ERROR_UNKNOWN;
@@ -558,6 +743,7 @@ kbase_compute_submit(struct panvk_gpu_queue *queue, struct vk_queue_submit *subm
             result = VK_ERROR_UNKNOWN;
             goto out;
          }
+         entry->stream_cpu = b->root_chunk.buffer.cpu;
       }
    }
    result = vk_sync_wait_many(&dev->vk, submit->wait_count, submit->waits,
@@ -571,14 +757,14 @@ kbase_compute_submit(struct panvk_gpu_queue *queue, struct vk_queue_submit *subm
          goto out;
       }
    }
-   if (graphics) {
+   if (renew_heap) {
       struct kbase_kmod_heap *old = queue->kbase.heap;
       queue->kbase.retired_heap = old;
       queue->kbase.heap = replacement;
       replacement = NULL;
       kbase_graphics_heap_desc(queue, queue->kbase.heap);
       pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
-      result = kbase_compute_execute(queue, rearm, 2);
+      result = kbase_compute_execute(queue, rearm, 2, true);
       if (result != VK_SUCCESS)
          goto out;
       if (kbase_kmod_heap_destroy(old)) {
@@ -599,12 +785,18 @@ kbase_compute_submit(struct panvk_gpu_queue *queue, struct vk_queue_submit *subm
       }
       if (!count)
          continue;
-      result = kbase_compute_execute(queue, wave, count);
+      result = kbase_compute_execute(queue, wave, count, !async_submit);
       if (result != VK_SUCCESS)
          goto out;
    }
    for (uint32_t i = 0; i < submit->signal_count; i++) {
-      result = vk_sync_signal(&dev->vk, submit->signals[i].sync, 0);
+      if (async_submit) {
+         result = panvk_kbase_sync_set_pending(
+            submit->signals[i].sync, &kbase_completion_ops, queue,
+            PANVK_SUBQUEUE_COUNT, queue->kbase.targets);
+      } else {
+         result = vk_sync_signal(&dev->vk, submit->signals[i].sync, 0);
+      }
       if (result != VK_SUCCESS) {
          result = vk_queue_set_lost(&queue->vk, "kbase signal failed");
          break;

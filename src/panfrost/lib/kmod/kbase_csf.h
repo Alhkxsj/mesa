@@ -36,6 +36,7 @@ struct pan_kmod_vm *kbase_csf_context_vm(struct kbase_csf_context *ctx);
 int kbase_csf_context_get_csif(struct kbase_csf_context *ctx,
                                struct drm_panthor_csif_info *out);
 int kbase_csf_context_status(struct kbase_csf_context *ctx);
+int kbase_csf_event_signal(struct kbase_csf_context *ctx);
 
 struct kbase_csf_queue *kbase_csf_queue_create(struct kbase_csf_context *ctx,
                                                uint32_t ring_size,
@@ -45,7 +46,14 @@ void kbase_csf_queue_unref(struct kbase_csf_queue *queue);
 void kbase_csf_queue_cancel(struct kbase_csf_queue *queue);
 int kbase_csf_queue_stop(struct kbase_csf_queue *queue);
 uint64_t kbase_csf_queue_seqno_va(struct kbase_csf_queue *queue);
+const void *kbase_csf_queue_seqno_map(struct kbase_csf_queue *queue);
 uint64_t kbase_csf_queue_published_target(struct kbase_csf_queue *queue);
+uint64_t kbase_csf_queue_extract(struct kbase_csf_queue *queue);
+uint32_t kbase_csf_queue_active(struct kbase_csf_queue *queue);
+uint64_t kbase_csf_queue_published_insert(struct kbase_csf_queue *queue);
+const void *kbase_csf_queue_ring_map(struct kbase_csf_queue *queue,
+                                     uint64_t *size);
+uint64_t kbase_csf_queue_ring_va(struct kbase_csf_queue *queue);
 int kbase_csf_queue_prepare(struct kbase_csf_queue *queue, const void *commands,
                             uint32_t size, uint64_t target);
 int kbase_csf_publish(struct kbase_csf_queue *const *queues, uint32_t count);

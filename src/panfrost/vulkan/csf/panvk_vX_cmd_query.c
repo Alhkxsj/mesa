@@ -22,7 +22,9 @@
 #include "panvk_cmd_ts.h"
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
+#include "panvk_instr.h"
 #include "panvk_macros.h"
+#include "panvk_physical_device.h"
 #include "panvk_query_pool.h"
 #include "panvk_queue.h"
 
@@ -333,7 +335,7 @@ panvk_cmd_end_occlusion_query(struct panvk_cmd_buffer *cmd,
    /* Signal the query syncobj after the flush is effective. */
    cs_move32_to(b, val, 1);
    cs_move64_to(b, oq_syncobj, panvk_query_available_dev_addr(pool, query));
-   cs_sync32_set(b, true, MALI_CS_SYNC_SCOPE_CSG, val, oq_syncobj,
+   cs_sync32_set(b, true, panvk_cs_signal_scope(cmd), val, oq_syncobj,
                  cs_defer(SB_MASK(DEFERRED_FLUSH), SB_ID(DEFERRED_SYNC)));
 }
 
@@ -713,7 +715,7 @@ panvk_cmd_end_prims_generated_query(
    /* Signal the query syncobj after the flush is effective. */
    cs_move32_to(b, val, 1);
    cs_move64_to(b, query_syncobj, panvk_query_available_dev_addr(pool, query));
-   cs_sync32_set(b, true, MALI_CS_SYNC_SCOPE_CSG, val, query_syncobj,
+   cs_sync32_set(b, true, panvk_cs_signal_scope(cmd), val, query_syncobj,
                  cs_defer(SB_MASK(DEFERRED_FLUSH), SB_ID(DEFERRED_SYNC)));
 }
 
