@@ -4,6 +4,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,8 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#include <linux/dma-heap.h>
 
 #include "drm-uapi/mali_kbase_ioctl.h"
 #include "kbase_kmod.h"
@@ -34,6 +37,7 @@ struct kbase_kmod_dev {
    bool jit_initialized;
    bool is_csf;
    bool alias_cleanup_uncertain;
+   int dma_heap_fd;
 };
 
 struct kbase_kmod_heap {
@@ -55,6 +59,10 @@ struct kbase_kmod_bo {
    uint64_t gpu_va;
    uint64_t memory_flags;
    bool same_va;
+   /* dma-buf fd backing this BO, or -1.  Both dma-heap-allocated BOs and
+    * externally imported BOs keep a dup here so bo_export() can hand out a
+    * fresh fd without involving the kernel. */
+   int dmabuf_fd;
 };
 
 static uint64_t
@@ -243,6 +251,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
       errno = error;
       return NULL;
    }
+   dev->dma_heap_fd = -1;
    struct util_sync_provider *sync = kbase_sync_provider_create();
    if (!sync) {
       int error = errno;
@@ -276,6 +285,17 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    dev->tracking_page = tracking;
    simple_mtx_init(&dev->jit_lock, mtx_plain);
    dev->is_csf = is_csf;
+
+   /* Opt-in dma-buf backing for WSI/export.  Without this, BOs are allocated
+    * through MEM_ALLOC and cannot be exported (kbase has no dma-buf exporter).
+    * Keeping it behind an environment variable preserves the default path. */
+   const char *heap_path = getenv("PANVK_KBASE_DMA_HEAP");
+   if (heap_path && heap_path[0] && strcmp(heap_path, "0") != 0) {
+      dev->dma_heap_fd = open(heap_path, O_RDONLY | O_CLOEXEC);
+      if (dev->dma_heap_fd < 0)
+         fprintf(stderr, "kbase: dma-heap %s unavailable: %s\n", heap_path,
+                 strerror(errno));
+   }
    return &dev->base;
 }
 
@@ -284,6 +304,8 @@ kbase_kmod_dev_destroy(struct pan_kmod_dev *base)
 {
    struct kbase_kmod_dev *dev = container_of(base, struct kbase_kmod_dev, base);
    const struct pan_kmod_allocator *allocator = base->allocator;
+   if (dev->dma_heap_fd >= 0)
+      close(dev->dma_heap_fd);
    munmap(dev->tracking_page, KBASE_PAGE_SIZE);
    pan_kmod_dev_cleanup(base);
    simple_mtx_destroy(&dev->jit_lock);
@@ -323,6 +345,32 @@ to_kbase_mem_flags(uint32_t flags)
    return value;
 }
 
+static struct pan_kmod_bo *kbase_kmod_bo_import(struct pan_kmod_dev *base,
+                                                 int fd);
+
+/* Allocate a BO from the dma-heap and import it into kbase.  The import keeps
+ * a dup of the dma-buf fd, so bo_export() can hand the same buffer to a
+ * compositor/WSI without a kernel-side dma-buf exporter. */
+static struct pan_kmod_bo *
+kbase_kmod_bo_alloc_dmabuf(struct pan_kmod_dev *base, uint64_t size)
+{
+   struct kbase_kmod_dev *dev = container_of(base, struct kbase_kmod_dev, base);
+   struct dma_heap_allocation_data alloc = {
+      .len = size,
+      .fd_flags = O_RDWR | O_CLOEXEC,
+   };
+
+   if (ioctl(dev->dma_heap_fd, DMA_HEAP_IOCTL_ALLOC, &alloc)) {
+      fprintf(stderr, "kbase: DMA_HEAP_IOCTL_ALLOC(%llu) failed: %s\n",
+              (unsigned long long)size, strerror(errno));
+      return NULL;
+   }
+
+   struct pan_kmod_bo *bo = kbase_kmod_bo_import(base, alloc.fd);
+   close(alloc.fd);
+   return bo;
+}
+
 static struct pan_kmod_bo *
 kbase_kmod_bo_alloc(struct pan_kmod_dev *base, struct pan_kmod_vm *vm,
                      uint64_t size, uint32_t flags)
@@ -338,6 +386,11 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *base, struct pan_kmod_vm *vm,
    }
    size = ALIGN_POT(size, KBASE_PAGE_SIZE);
    struct kbase_kmod_dev *dev = container_of(base, struct kbase_kmod_dev, base);
+   if (!vm && dev->dma_heap_fd >= 0 &&
+       !(flags & (PAN_KMOD_BO_FLAG_EXECUTABLE |
+                  PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT |
+                  PAN_KMOD_BO_FLAG_CSF_EVENT)))
+      return kbase_kmod_bo_alloc_dmabuf(base, size);
    uint32_t previous;
    do {
       previous = p_atomic_read(&dev->next_handle);
@@ -352,6 +405,7 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *base, struct pan_kmod_vm *vm,
       errno = ENOMEM;
       return NULL;
    }
+   bo->dmabuf_fd = -1;
    uint64_t memory_flags = to_kbase_mem_flags(flags);
    uint64_t handle;
    if (dev->is_csf && pan_kmod_driver_version_at_least(&base->driver, 1, 9)) {
@@ -421,6 +475,8 @@ kbase_kmod_bo_free(struct pan_kmod_bo *base)
       struct kbase_ioctl_mem_free req = {.gpu_addr = bo->gpu_va};
       ioctl(base->dev->fd, KBASE_IOCTL_MEM_FREE, &req);
    }
+   if (bo->dmabuf_fd >= 0)
+      close(bo->dmabuf_fd);
    pan_kmod_dev_free(base->dev, bo);
 }
 
@@ -447,6 +503,7 @@ kbase_kmod_bo_import(struct pan_kmod_dev *base, int fd)
       errno = ENOMEM;
       return NULL;
    }
+   bo->dmabuf_fd = -1;
 
    int handle_fd = fd;
    /* Stage 1: import through UMM and request explicit cache maintenance at
@@ -529,6 +586,7 @@ kbase_kmod_bo_import(struct pan_kmod_dev *base, int fd)
       bo->same_va = false;
    }
 
+   bo->dmabuf_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
    bo->memory_flags = req.out.flags;
    pan_kmod_bo_init(&bo->base, base, NULL, size,
                     PAN_KMOD_BO_FLAG_IMPORTED | PAN_KMOD_BO_FLAG_NO_MMAP,
@@ -554,10 +612,16 @@ error: {
 }
 
 static int
-kbase_kmod_bo_export(UNUSED struct pan_kmod_bo *bo)
+kbase_kmod_bo_export(struct pan_kmod_bo *base)
 {
-   errno = ENOTSUP;
-   return -1;
+   struct kbase_kmod_bo *bo = container_of(base, struct kbase_kmod_bo, base);
+
+   if (bo->dmabuf_fd < 0) {
+      errno = ENOTSUP;
+      return -1;
+   }
+
+   return fcntl(bo->dmabuf_fd, F_DUPFD_CLOEXEC, 3);
 }
 
 static void *
